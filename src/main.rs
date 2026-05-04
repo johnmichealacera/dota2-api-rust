@@ -279,7 +279,9 @@ async fn main() {
 }
 
 fn build_cors_layer() -> CorsLayer {
-    let default_origins = String::from("http://localhost:8080,https://dota2-companion.vercel.app");
+    let default_origins = String::from(
+        "http://localhost:8080,https://dota2-companion.vercel.app,https://dota2-companion.johnmichealacera.com",
+    );
     let raw = env::var("DOTA_SITE").unwrap_or(default_origins);
     let origins: Vec<HeaderValue> = raw
         .split(',')

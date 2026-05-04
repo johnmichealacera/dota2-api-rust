@@ -29,6 +29,11 @@ Rust conversion of the Node.js Dota API backend, preserving the existing REST co
 
 Server runs on `http://localhost:8000` by default.
 
+### CORS
+
+Set `DOTA_SITE` as a comma-separated origin allowlist, for example:
+`DOTA_SITE=http://localhost:8080,https://dota2-companion.vercel.app,https://dota2-companion.johnmichealacera.com`
+
 ## Notes
 
 - Response shapes are aligned with your existing Node backend contract to avoid frontend changes.
