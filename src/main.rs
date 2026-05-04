@@ -152,18 +152,6 @@ struct HeroDto {
     hover_third: i64,
 }
 
-#[derive(Debug, Deserialize)]
-struct TeamRaw {
-    team_id: i64,
-    name: Option<String>,
-    rating: Option<f64>,
-    wins: Option<i64>,
-    losses: Option<i64>,
-    last_match_time: Option<String>,
-    tag: Option<String>,
-    logo_url: Option<String>,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct TeamDto {
     id: i64,
@@ -389,22 +377,10 @@ async fn get_pro_teams(
         value
     } else {
         let url = format!("{}/teams", state.open_dota_api_url);
-        let teams_raw: Vec<TeamRaw> = state.client.get(url).send().await?.json().await?;
+        let teams_raw: Vec<Value> = state.client.get(url).send().await?.json().await?;
         let mapped: Vec<TeamCardDto> = teams_raw
-            .into_iter()
-            .map(|item| TeamCardDto {
-                id: item.team_id,
-                name: item.name.unwrap_or_default(),
-                rating: item.rating.unwrap_or_default(),
-                wins: item.wins.unwrap_or_default(),
-                losses: item.losses.unwrap_or_default(),
-                last_match_time: item.last_match_time,
-                tag: item.tag.unwrap_or_default(),
-                img: item.logo_url.unwrap_or_default(),
-                hover_first: item.rating.unwrap_or_default(),
-                hover_second: item.wins.unwrap_or_default(),
-                hover_third: item.losses.unwrap_or_default(),
-            })
+            .iter()
+            .map(map_team_card)
             .collect();
         set_cache(&state, key, &mapped).await?;
         mapped
@@ -423,17 +399,8 @@ async fn get_team_by_id(
     }
 
     let url = format!("{}/teams/{id}", state.open_dota_api_url);
-    let team: TeamRaw = state.client.get(url).send().await?.json().await?;
-    let dto = TeamDto {
-        id: team.team_id,
-        name: team.name.unwrap_or_default(),
-        rating: team.rating.unwrap_or_default(),
-        wins: team.wins.unwrap_or_default(),
-        losses: team.losses.unwrap_or_default(),
-        last_match_time: team.last_match_time.unwrap_or_default(),
-        tag: team.tag.unwrap_or_default(),
-        img: team.logo_url.unwrap_or_default(),
-    };
+    let team: Value = state.client.get(url).send().await?.json().await?;
+    let dto = map_team(&team);
     set_cache(&state, &key, &dto).await?;
     Ok(Json(dto))
 }
@@ -602,5 +569,70 @@ fn empty_hero() -> HeroDto {
         hover_first: 0,
         hover_second: 0,
         hover_third: 0,
+    }
+}
+
+fn map_team_card(item: &Value) -> TeamCardDto {
+    let rating = value_to_f64(item.get("rating"));
+    let wins = value_to_i64(item.get("wins"));
+    let losses = value_to_i64(item.get("losses"));
+
+    TeamCardDto {
+        id: value_to_i64(item.get("team_id")),
+        name: value_to_string(item.get("name")),
+        rating,
+        wins,
+        losses,
+        last_match_time: value_to_optional_string(item.get("last_match_time")),
+        tag: value_to_string(item.get("tag")),
+        img: value_to_string(item.get("logo_url")),
+        hover_first: rating,
+        hover_second: wins,
+        hover_third: losses,
+    }
+}
+
+fn map_team(item: &Value) -> TeamDto {
+    TeamDto {
+        id: value_to_i64(item.get("team_id")),
+        name: value_to_string(item.get("name")),
+        rating: value_to_f64(item.get("rating")),
+        wins: value_to_i64(item.get("wins")),
+        losses: value_to_i64(item.get("losses")),
+        last_match_time: value_to_optional_string(item.get("last_match_time")).unwrap_or_default(),
+        tag: value_to_string(item.get("tag")),
+        img: value_to_string(item.get("logo_url")),
+    }
+}
+
+fn value_to_i64(value: Option<&Value>) -> i64 {
+    match value {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or_default(),
+        Some(Value::String(s)) => s.parse::<i64>().unwrap_or_default(),
+        _ => 0,
+    }
+}
+
+fn value_to_f64(value: Option<&Value>) -> f64 {
+    match value {
+        Some(Value::Number(n)) => n.as_f64().unwrap_or_default(),
+        Some(Value::String(s)) => s.parse::<f64>().unwrap_or_default(),
+        _ => 0.0,
+    }
+}
+
+fn value_to_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn value_to_optional_string(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Null) | None => None,
+        Some(v) => Some(value_to_string(Some(v))),
     }
 }
