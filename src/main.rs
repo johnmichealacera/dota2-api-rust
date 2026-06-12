@@ -255,6 +255,18 @@ struct ProPlayerDto {
     avatar: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct HeroStatDto {
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    #[serde(rename = "winRate")]
+    win_rate: f64,
+    #[serde(rename = "totalPicks")]
+    total_picks: i64,
+    #[serde(rename = "totalBans")]
+    total_bans: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProMatchRaw {
     match_id: Option<i64>,
@@ -340,30 +352,34 @@ async fn main() {
 
     let state = AppState {
         client: Client::builder()
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(30))
             .user_agent("dota-mate/1.0")
-            .pool_max_idle_per_host(10)
+            .pool_max_idle_per_host(4) // keep connections modest to avoid overwhelming OpenDota
             .build()
             .expect("failed to build HTTP client"),
         open_dota_api_url,
         cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    // Pre-warm the cache immediately on boot so first user request is instant
+    // Pre-warm the cache sequentially with gaps to stay within OpenDota's rate limit.
+    // Parallel warmup saturates the free-tier concurrency and causes user requests to time out.
     {
         let s = state.clone();
         tokio::spawn(async move {
-            let (heroes, players, teams) = tokio::join!(
-                fetch_heroes(&s),
-                fetch_pro_players(&s),
-                fetch_pro_teams(&s),
-            );
-            info!(
-                "startup warm-up — heroes:{} players:{} teams:{}",
-                heroes.is_ok(),
-                players.is_ok(),
-                teams.is_ok(),
-            );
+            macro_rules! warm {
+                ($label:expr, $fut:expr) => {
+                    match $fut.await {
+                        Ok(_)  => info!("warm-up: {} ✓", $label),
+                        Err(e) => info!("warm-up: {} failed — {:?}", $label, e),
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                };
+            }
+            warm!("heroes",     fetch_heroes(&s));
+            warm!("hero-stats", fetch_hero_stats(&s));
+            warm!("teams",      fetch_pro_teams(&s));
+            warm!("players",    fetch_pro_players(&s));
+            info!("startup warm-up complete");
         });
     }
 
@@ -391,6 +407,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/heroes", get(get_heroes))
+        .route("/hero-stats", get(get_hero_stats))
         .route("/hero/:id", get(get_hero_by_id))
         .route("/hero-matchup/:id", get(get_hero_matchup))
         .route("/pro-players", get(get_pro_players))
@@ -458,6 +475,13 @@ async fn get_hero_by_id(
     Ok(Json(hero))
 }
 
+async fn get_hero_stats(
+    State(state): State<AppState>,
+) -> Result<Json<HashMap<String, HeroStatDto>>, ApiError> {
+    let stats = fetch_hero_stats(&state).await?;
+    Ok(Json(stats))
+}
+
 async fn get_hero_matchup(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -468,7 +492,7 @@ async fn get_hero_matchup(
         cached
     } else {
         let url = format!("{}/heroes/{id}/matchups", state.open_dota_api_url);
-        let matchups: Vec<HeroMatchupRaw> = state.client.get(url).send().await?.json().await?;
+        let matchups: Vec<HeroMatchupRaw> = fetch_url(&state.client, &url).await?;
         let heroes = fetch_heroes(&state).await?;
 
         let mut mapped: Vec<MatchupDto> = matchups
@@ -516,7 +540,7 @@ async fn get_pro_matches(
         cached
     } else {
         let url = format!("{}/proMatches", state.open_dota_api_url);
-        let raw: Vec<ProMatchRaw> = state.client.get(url).send().await?.json().await?;
+        let raw: Vec<ProMatchRaw> = fetch_url(&state.client, &url).await?;
         let mapped: Vec<ProMatchDto> = raw.into_iter().filter_map(map_pro_match).collect();
         set_cache(&state, key, &mapped, FEED_TTL).await?;
         mapped
@@ -541,7 +565,7 @@ async fn get_team_by_id(
         return Ok(Json(cached));
     }
     let url = format!("{}/teams/{id}", state.open_dota_api_url);
-    let team: Value = state.client.get(url).send().await?.json().await?;
+    let team: Value = fetch_url(&state.client, &url).await?;
     let dto = map_team(&team);
     set_cache(&state, &key, &dto, MATCHUP_TTL).await?;
     Ok(Json(dto))
@@ -557,7 +581,7 @@ async fn get_team_matchup(
         cached
     } else {
         let url = format!("{}/teams/{id}/matches", state.open_dota_api_url);
-        let matches: Vec<TeamMatchRaw> = state.client.get(url).send().await?.json().await?;
+        let matches: Vec<TeamMatchRaw> = fetch_url(&state.client, &url).await?;
         let grouped = group_team_matchups(matches);
         set_cache(&state, &key, &grouped, MATCHUP_TTL).await?;
         grouped
@@ -575,7 +599,7 @@ async fn fetch_heroes(state: &AppState) -> Result<Vec<HeroDto>, ApiError> {
     }
 
     let url = format!("{}/constants/heroes", state.open_dota_api_url);
-    let payload: HashMap<String, HeroRaw> = state.client.get(url).send().await?.json().await?;
+    let payload: HashMap<String, HeroRaw> = fetch_url(&state.client, &url).await?;
     let mut heroes: Vec<HeroDto> = payload
         .into_values()
         .map(|hero| {
@@ -609,13 +633,42 @@ async fn fetch_heroes(state: &AppState) -> Result<Vec<HeroDto>, ApiError> {
     Ok(heroes)
 }
 
+async fn fetch_hero_stats(state: &AppState) -> Result<HashMap<String, HeroStatDto>, ApiError> {
+    let key = "heroStats";
+    if let Some(cached) = try_get_cache::<HashMap<String, HeroStatDto>>(state, key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/heroStats", state.open_dota_api_url);
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+
+    let mut map: HashMap<String, HeroStatDto> = HashMap::new();
+    for v in &raw {
+        let Some(id) = v.get("id").and_then(|x| x.as_i64()) else { continue };
+
+        // Use pro-circuit stats exclusively so pick/win/ban are from the same population
+        let total_picks = v.get("pro_pick").and_then(|x| x.as_i64()).unwrap_or(0);
+        let total_wins  = v.get("pro_win" ).and_then(|x| x.as_i64()).unwrap_or(0);
+        let total_bans  = v.get("pro_ban" ).and_then(|x| x.as_i64()).unwrap_or(0);
+
+        let win_rate = if total_picks == 0 { 50.0 } else {
+            (total_wins as f64 / total_picks as f64) * 100.0
+        };
+
+        map.insert(id.to_string(), HeroStatDto { hero_id: id, win_rate, total_picks, total_bans });
+    }
+
+    set_cache(state, key, &map, LIST_TTL).await?;
+    Ok(map)
+}
+
 async fn fetch_pro_players(state: &AppState) -> Result<Vec<ProPlayerDto>, ApiError> {
     let key = "proPlayers";
     if let Some(cached) = try_get_cache::<Vec<ProPlayerDto>>(state, key).await? {
         return Ok(cached);
     }
     let url = format!("{}/proPlayers", state.open_dota_api_url);
-    let raw: Vec<ProPlayerRaw> = state.client.get(url).send().await?.json().await?;
+    let raw: Vec<ProPlayerRaw> = fetch_url(&state.client, &url).await?;
     let mut mapped: Vec<ProPlayerDto> = raw
         .into_iter()
         .filter(|p| p.account_id.is_some())
@@ -633,10 +686,29 @@ async fn fetch_pro_teams(state: &AppState) -> Result<Vec<TeamCardDto>, ApiError>
         return Ok(cached);
     }
     let url = format!("{}/teams", state.open_dota_api_url);
-    let raw: Vec<Value> = state.client.get(url).send().await?.json().await?;
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
     let mapped: Vec<TeamCardDto> = raw.iter().map(map_team_card).collect();
     set_cache(state, key, &mapped, LIST_TTL).await?;
     Ok(mapped)
+}
+
+// ── Upstream fetch with retry ─────────────────────────────────────────────────
+
+async fn fetch_url<T>(client: &Client, url: &str) -> Result<T, ApiError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let result = client.get(url).send().await;
+    let response = match result {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() || e.is_connect() => {
+            info!("transient error on {url}, retrying in 3s…");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            client.get(url).send().await?
+        }
+        Err(e) => return Err(ApiError::Upstream(e)),
+    };
+    Ok(response.json::<T>().await?)
 }
 
 // ── Cache helpers ─────────────────────────────────────────────────────────────
