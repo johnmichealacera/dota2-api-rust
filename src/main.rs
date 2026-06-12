@@ -27,6 +27,7 @@ const HERO_URL_BASE: &str =
 // Cache TTLs — lists refresh every 6 h; per-entity matchup data every 24 h
 const LIST_TTL: Duration = Duration::from_secs(6 * 3600);
 const MATCHUP_TTL: Duration = Duration::from_secs(24 * 3600);
+const FEED_TTL: Duration = Duration::from_secs(5 * 60); // pro matches — high velocity content
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
@@ -255,6 +256,49 @@ struct ProPlayerDto {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProMatchRaw {
+    match_id: Option<i64>,
+    duration: Option<i64>,
+    start_time: Option<i64>,
+    radiant_team_id: Option<i64>,
+    radiant_name: Option<String>,
+    dire_team_id: Option<i64>,
+    dire_name: Option<String>,
+    league_id: Option<i64>,
+    league_name: Option<String>,
+    radiant_score: Option<i64>,
+    dire_score: Option<i64>,
+    radiant_win: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ProMatchDto {
+    #[serde(rename = "matchId")]
+    match_id: i64,
+    duration: i64,
+    #[serde(rename = "startTime")]
+    start_time: i64,
+    #[serde(rename = "radiantTeamId")]
+    radiant_team_id: i64,
+    #[serde(rename = "radiantName")]
+    radiant_name: String,
+    #[serde(rename = "direTeamId")]
+    dire_team_id: i64,
+    #[serde(rename = "direName")]
+    dire_name: String,
+    #[serde(rename = "leagueId")]
+    league_id: i64,
+    #[serde(rename = "leagueName")]
+    league_name: String,
+    #[serde(rename = "radiantScore")]
+    radiant_score: i64,
+    #[serde(rename = "direScore")]
+    dire_score: i64,
+    #[serde(rename = "radiantWin")]
+    radiant_win: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct TeamMatchRaw {
     opposing_team_id: Option<i64>,
     opposing_team_name: Option<String>,
@@ -350,6 +394,7 @@ async fn main() {
         .route("/hero/:id", get(get_hero_by_id))
         .route("/hero-matchup/:id", get(get_hero_matchup))
         .route("/pro-players", get(get_pro_players))
+        .route("/pro-matches", get(get_pro_matches))
         .route("/pro-teams", get(get_pro_teams))
         .route("/team/:id", get(get_team_by_id))
         .route("/team-matchup/:id", get(get_team_matchup))
@@ -460,6 +505,23 @@ async fn get_pro_players(
 ) -> Result<Json<PaginatedResponse<ProPlayerDto>>, ApiError> {
     let players = fetch_pro_players(&state).await?;
     Ok(Json(paginate(players, query)))
+}
+
+async fn get_pro_matches(
+    State(state): State<AppState>,
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<PaginatedResponse<ProMatchDto>>, ApiError> {
+    let key = "proMatches";
+    let matches = if let Some(cached) = try_get_cache::<Vec<ProMatchDto>>(&state, key).await? {
+        cached
+    } else {
+        let url = format!("{}/proMatches", state.open_dota_api_url);
+        let raw: Vec<ProMatchRaw> = state.client.get(url).send().await?.json().await?;
+        let mapped: Vec<ProMatchDto> = raw.into_iter().filter_map(map_pro_match).collect();
+        set_cache(&state, key, &mapped, FEED_TTL).await?;
+        mapped
+    };
+    Ok(Json(paginate(matches, query)))
 }
 
 async fn get_pro_teams(
@@ -633,6 +695,24 @@ fn paginate<T: Clone>(items: Vec<T>, query: PaginationQuery) -> PaginatedRespons
 }
 
 // ── Mapping helpers ───────────────────────────────────────────────────────────
+
+fn map_pro_match(raw: ProMatchRaw) -> Option<ProMatchDto> {
+    let match_id = raw.match_id?;
+    Some(ProMatchDto {
+        match_id,
+        duration: raw.duration.unwrap_or(0),
+        start_time: raw.start_time.unwrap_or(0),
+        radiant_team_id: raw.radiant_team_id.unwrap_or(0),
+        radiant_name: raw.radiant_name.unwrap_or_else(|| "Radiant".to_string()),
+        dire_team_id: raw.dire_team_id.unwrap_or(0),
+        dire_name: raw.dire_name.unwrap_or_else(|| "Dire".to_string()),
+        league_id: raw.league_id.unwrap_or(0),
+        league_name: raw.league_name.unwrap_or_default(),
+        radiant_score: raw.radiant_score.unwrap_or(0),
+        dire_score: raw.dire_score.unwrap_or(0),
+        radiant_win: raw.radiant_win.unwrap_or(false),
+    })
+}
 
 fn map_pro_player(raw: ProPlayerRaw) -> ProPlayerDto {
     let display_name = raw
