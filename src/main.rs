@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Method, StatusCode};
@@ -14,19 +15,37 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 const DEFAULT_OPEN_DOTA_API_URL: &str = "https://api.opendota.com/api";
-const HERO_URL_BASE: &str = "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes";
+const HERO_URL_BASE: &str =
+    "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes";
+
+// Cache TTLs — lists refresh every 6 h; per-entity matchup data every 24 h
+const LIST_TTL: Duration = Duration::from_secs(6 * 3600);
+const MATCHUP_TTL: Duration = Duration::from_secs(24 * 3600);
+
+// ── Cache ─────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct CacheEntry {
+    value: Value,
+    expires_at: Instant,
+}
+
+// ── App state ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
     client: Client,
     open_dota_api_url: String,
-    cache: Arc<RwLock<HashMap<String, Value>>>,
+    cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
 }
+
+// ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 enum ApiError {
@@ -69,6 +88,8 @@ impl From<serde_json::Error> for ApiError {
     }
 }
 
+// ── Pagination ────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Deserialize)]
 struct PaginationQuery {
     page: Option<usize>,
@@ -93,6 +114,8 @@ struct PaginatedResponse<T> {
     items: Vec<T>,
     pagination: PaginationMeta,
 }
+
+// ── DTOs ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct HeroRaw {
@@ -255,6 +278,8 @@ struct TeamMatchupDto {
     league_name: String,
 }
 
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() {
     dotenv().ok();
@@ -266,14 +291,58 @@ async fn main() {
         env::var("OPEN_DOTA_API_URL").unwrap_or_else(|_| DEFAULT_OPEN_DOTA_API_URL.to_string());
     let port: u16 = env::var("PORT")
         .ok()
-        .and_then(|value| value.parse().ok())
+        .and_then(|v| v.parse().ok())
         .unwrap_or(8000);
 
     let state = AppState {
-        client: Client::new(),
+        client: Client::builder()
+            .timeout(Duration::from_secs(20))
+            .user_agent("dota-mate/1.0")
+            .pool_max_idle_per_host(10)
+            .build()
+            .expect("failed to build HTTP client"),
         open_dota_api_url,
         cache: Arc::new(RwLock::new(HashMap::new())),
     };
+
+    // Pre-warm the cache immediately on boot so first user request is instant
+    {
+        let s = state.clone();
+        tokio::spawn(async move {
+            let (heroes, players, teams) = tokio::join!(
+                fetch_heroes(&s),
+                fetch_pro_players(&s),
+                fetch_pro_teams(&s),
+            );
+            info!(
+                "startup warm-up — heroes:{} players:{} teams:{}",
+                heroes.is_ok(),
+                players.is_ok(),
+                teams.is_ok(),
+            );
+        });
+    }
+
+    // On Render free tier: self-ping every 14 min to prevent the 15-min idle spin-down
+    if let Ok(hostname) = env::var("RENDER_EXTERNAL_HOSTNAME") {
+        let ping_url = format!("https://{hostname}/");
+        let ping_client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(14 * 60));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                match ping_client.get(&ping_url).send().await {
+                    Ok(_)  => info!("keep-alive ping OK → {ping_url}"),
+                    Err(e) => info!("keep-alive ping failed: {e}"),
+                }
+            }
+        });
+        info!("keep-alive task started → https://{hostname}/");
+    }
 
     let app = Router::new()
         .route("/", get(root))
@@ -285,6 +354,7 @@ async fn main() {
         .route("/team/:id", get(get_team_by_id))
         .route("/team-matchup/:id", get(get_team_matchup))
         .with_state(state)
+        .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(build_cors_layer());
 
@@ -294,6 +364,8 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+// ── CORS ──────────────────────────────────────────────────────────────────────
+
 fn build_cors_layer() -> CorsLayer {
     let default_origins = String::from(
         "http://localhost:8080,https://dota2-companion.vercel.app,https://dota2-companion.johnmichealacera.com",
@@ -301,7 +373,7 @@ fn build_cors_layer() -> CorsLayer {
     let raw = env::var("DOTA_SITE").unwrap_or(default_origins);
     let origins: Vec<HeaderValue> = raw
         .split(',')
-        .filter_map(|origin| HeaderValue::from_str(origin.trim()).ok())
+        .filter_map(|o| HeaderValue::from_str(o.trim()).ok())
         .collect();
 
     let base = CorsLayer::new()
@@ -314,6 +386,8 @@ fn build_cors_layer() -> CorsLayer {
         base.allow_origin(origins)
     }
 }
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn root() -> &'static str {
     "Dota API Rust backend is running."
@@ -345,9 +419,8 @@ async fn get_hero_matchup(
     Query(query): Query<PaginationQuery>,
 ) -> Result<Json<PaginatedResponse<MatchupDto>>, ApiError> {
     let key = format!("dotaHeroMatchup-{id}");
-    let cached = try_get_cache::<Vec<MatchupDto>>(&state, &key).await?;
-    let data = if let Some(value) = cached {
-        value
+    let data = if let Some(cached) = try_get_cache::<Vec<MatchupDto>>(&state, &key).await? {
+        cached
     } else {
         let url = format!("{}/heroes/{id}/matchups", state.open_dota_api_url);
         let matchups: Vec<HeroMatchupRaw> = state.client.get(url).send().await?.json().await?;
@@ -355,28 +428,26 @@ async fn get_hero_matchup(
 
         let mut mapped: Vec<MatchupDto> = matchups
             .into_iter()
-            .map(|matchup| {
-                let hero = heroes.iter().find(|hero| hero.id == matchup.hero_id);
-                let games = matchup.games_played;
-                let wins = matchup.wins;
-                let win_rate = if games == 0 {
+            .map(|m| {
+                let hero = heroes.iter().find(|h| h.id == m.hero_id);
+                let wr = if m.games_played == 0 {
                     0.0
                 } else {
-                    (wins as f64 / games as f64) * 100.0
+                    (m.wins as f64 / m.games_played as f64) * 100.0
                 };
                 MatchupDto {
-                    id: matchup.hero_id,
-                    name: hero.map_or(String::new(), |item| item.name.clone()),
-                    img: hero.map_or(String::new(), |item| item.img.clone()),
-                    wins,
-                    games_played: games,
-                    win_rate,
+                    id: m.hero_id,
+                    name: hero.map_or(String::new(), |h| h.name.clone()),
+                    img: hero.map_or(String::new(), |h| h.img.clone()),
+                    wins: m.wins,
+                    games_played: m.games_played,
+                    win_rate: wr,
                 }
             })
             .collect();
 
         mapped.sort_by(|a, b| b.win_rate.partial_cmp(&a.win_rate).unwrap_or(Ordering::Equal));
-        set_cache(&state, &key, &mapped).await?;
+        set_cache(&state, &key, &mapped, MATCHUP_TTL).await?;
         mapped
     };
 
@@ -387,24 +458,7 @@ async fn get_pro_players(
     State(state): State<AppState>,
     Query(query): Query<PaginationQuery>,
 ) -> Result<Json<PaginatedResponse<ProPlayerDto>>, ApiError> {
-    let key = "proPlayers";
-    let cached = try_get_cache::<Vec<ProPlayerDto>>(&state, key).await?;
-    let players = if let Some(value) = cached {
-        value
-    } else {
-        let url = format!("{}/proPlayers", state.open_dota_api_url);
-        let raw: Vec<ProPlayerRaw> = state.client.get(url).send().await?.json().await?;
-        let mut mapped: Vec<ProPlayerDto> = raw
-            .into_iter()
-            .filter(|p| p.account_id.is_some())
-            .map(map_pro_player)
-            .filter(|p| !p.name.is_empty())
-            .collect();
-        mapped.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        set_cache(&state, key, &mapped).await?;
-        mapped
-    };
-
+    let players = fetch_pro_players(&state).await?;
     Ok(Json(paginate(players, query)))
 }
 
@@ -412,21 +466,7 @@ async fn get_pro_teams(
     State(state): State<AppState>,
     Query(query): Query<PaginationQuery>,
 ) -> Result<Json<PaginatedResponse<TeamCardDto>>, ApiError> {
-    let key = "proTeams";
-    let cached = try_get_cache::<Vec<TeamCardDto>>(&state, key).await?;
-    let teams = if let Some(value) = cached {
-        value
-    } else {
-        let url = format!("{}/teams", state.open_dota_api_url);
-        let teams_raw: Vec<Value> = state.client.get(url).send().await?.json().await?;
-        let mapped: Vec<TeamCardDto> = teams_raw
-            .iter()
-            .map(map_team_card)
-            .collect();
-        set_cache(&state, key, &mapped).await?;
-        mapped
-    };
-
+    let teams = fetch_pro_teams(&state).await?;
     Ok(Json(paginate(teams, query)))
 }
 
@@ -438,11 +478,10 @@ async fn get_team_by_id(
     if let Some(cached) = try_get_cache::<TeamDto>(&state, &key).await? {
         return Ok(Json(cached));
     }
-
     let url = format!("{}/teams/{id}", state.open_dota_api_url);
     let team: Value = state.client.get(url).send().await?.json().await?;
     let dto = map_team(&team);
-    set_cache(&state, &key, &dto).await?;
+    set_cache(&state, &key, &dto, MATCHUP_TTL).await?;
     Ok(Json(dto))
 }
 
@@ -452,74 +491,20 @@ async fn get_team_matchup(
     Query(query): Query<PaginationQuery>,
 ) -> Result<Json<PaginatedResponse<TeamMatchupDto>>, ApiError> {
     let key = format!("dotaTeamMatchup-{id}");
-    let cached = try_get_cache::<Vec<TeamMatchupDto>>(&state, &key).await?;
-    let matchups = if let Some(value) = cached {
-        value
+    let matchups = if let Some(cached) = try_get_cache::<Vec<TeamMatchupDto>>(&state, &key).await? {
+        cached
     } else {
         let url = format!("{}/teams/{id}/matches", state.open_dota_api_url);
         let matches: Vec<TeamMatchRaw> = state.client.get(url).send().await?.json().await?;
         let grouped = group_team_matchups(matches);
-        set_cache(&state, &key, &grouped).await?;
+        set_cache(&state, &key, &grouped, MATCHUP_TTL).await?;
         grouped
     };
 
     Ok(Json(paginate(matchups, query)))
 }
 
-fn map_pro_player(raw: ProPlayerRaw) -> ProPlayerDto {
-    let display_name = raw
-        .name
-        .filter(|s| !s.is_empty())
-        .or(raw.personaname)
-        .unwrap_or_default();
-
-    ProPlayerDto {
-        account_id: raw.account_id.unwrap_or_default(),
-        name: display_name,
-        team_name: raw.team_name.unwrap_or_default(),
-        team_tag: raw.team_tag.unwrap_or_default(),
-        country_code: raw.country_code.unwrap_or_default(),
-        fantasy_role: raw.fantasy_role.unwrap_or(-1),
-        avatar: raw.avatarfull.unwrap_or_default(),
-    }
-}
-
-fn group_team_matchups(matches: Vec<TeamMatchRaw>) -> Vec<TeamMatchupDto> {
-    let mut grouped: HashMap<i64, TeamMatchupDto> = HashMap::new();
-
-    for item in matches {
-        let id = item.opposing_team_id.unwrap_or_default();
-        let entry = grouped.entry(id).or_insert(TeamMatchupDto {
-            id,
-            wins: 0,
-            games_played: 0,
-            win_rate: 0.0,
-            name: item.opposing_team_name.clone().unwrap_or_default(),
-            img: item.opposing_team_logo.clone().unwrap_or_default(),
-            league_name: item.league_name.clone().unwrap_or_default(),
-        });
-
-        if item.radiant == item.radiant_win {
-            entry.wins += 1;
-        }
-        entry.games_played += 1;
-        if entry.games_played > 0 {
-            entry.win_rate = (entry.wins as f64 / entry.games_played as f64) * 100.0;
-        }
-
-        if entry.name.is_empty() {
-            entry.name = item.opposing_team_name.unwrap_or_default();
-        }
-        if entry.img.is_empty() {
-            entry.img = item.opposing_team_logo.unwrap_or_default();
-        }
-        if entry.league_name.is_empty() {
-            entry.league_name = item.league_name.unwrap_or_default();
-        }
-    }
-
-    grouped.into_values().collect()
-}
+// ── Internal fetch functions (shared by handlers + warmup) ────────────────────
 
 async fn fetch_heroes(state: &AppState) -> Result<Vec<HeroDto>, ApiError> {
     let key = "dotaHeroes";
@@ -557,43 +542,84 @@ async fn fetch_heroes(state: &AppState) -> Result<Vec<HeroDto>, ApiError> {
             }
         })
         .collect();
-    heroes.sort_by_key(|hero| hero.id);
-
-    set_cache(state, key, &heroes).await?;
+    heroes.sort_by_key(|h| h.id);
+    set_cache(state, key, &heroes, LIST_TTL).await?;
     Ok(heroes)
 }
+
+async fn fetch_pro_players(state: &AppState) -> Result<Vec<ProPlayerDto>, ApiError> {
+    let key = "proPlayers";
+    if let Some(cached) = try_get_cache::<Vec<ProPlayerDto>>(state, key).await? {
+        return Ok(cached);
+    }
+    let url = format!("{}/proPlayers", state.open_dota_api_url);
+    let raw: Vec<ProPlayerRaw> = state.client.get(url).send().await?.json().await?;
+    let mut mapped: Vec<ProPlayerDto> = raw
+        .into_iter()
+        .filter(|p| p.account_id.is_some())
+        .map(map_pro_player)
+        .filter(|p| !p.name.is_empty())
+        .collect();
+    mapped.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    set_cache(state, key, &mapped, LIST_TTL).await?;
+    Ok(mapped)
+}
+
+async fn fetch_pro_teams(state: &AppState) -> Result<Vec<TeamCardDto>, ApiError> {
+    let key = "proTeams";
+    if let Some(cached) = try_get_cache::<Vec<TeamCardDto>>(state, key).await? {
+        return Ok(cached);
+    }
+    let url = format!("{}/teams", state.open_dota_api_url);
+    let raw: Vec<Value> = state.client.get(url).send().await?.json().await?;
+    let mapped: Vec<TeamCardDto> = raw.iter().map(map_team_card).collect();
+    set_cache(state, key, &mapped, LIST_TTL).await?;
+    Ok(mapped)
+}
+
+// ── Cache helpers ─────────────────────────────────────────────────────────────
 
 async fn try_get_cache<T>(state: &AppState, key: &str) -> Result<Option<T>, ApiError>
 where
     T: for<'de> Deserialize<'de>,
 {
     let map = state.cache.read().await;
-    if let Some(value) = map.get(key) {
-        let item = serde_json::from_value(value.clone())?;
-        return Ok(Some(item));
+    if let Some(entry) = map.get(key) {
+        if Instant::now() < entry.expires_at {
+            let item = serde_json::from_value(entry.value.clone())?;
+            return Ok(Some(item));
+        }
     }
     Ok(None)
 }
 
-async fn set_cache<T>(state: &AppState, key: &str, value: &T) -> Result<(), ApiError>
+async fn set_cache<T>(state: &AppState, key: &str, value: &T, ttl: Duration) -> Result<(), ApiError>
 where
     T: Serialize,
 {
     let mut map = state.cache.write().await;
-    map.insert(key.to_string(), serde_json::to_value(value)?);
+    map.insert(
+        key.to_string(),
+        CacheEntry {
+            value: serde_json::to_value(value)?,
+            expires_at: Instant::now() + ttl,
+        },
+    );
     Ok(())
 }
 
-fn paginate<T>(items: Vec<T>, query: PaginationQuery) -> PaginatedResponse<T>
-where
-    T: Clone,
-{
+// ── Pagination ────────────────────────────────────────────────────────────────
+
+fn paginate<T: Clone>(items: Vec<T>, query: PaginationQuery) -> PaginatedResponse<T> {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(10).max(1);
     let total_items = items.len();
-    let total_pages = if total_items == 0 { 1 } else { total_items.div_ceil(page_size) };
+    let total_pages = if total_items == 0 {
+        1
+    } else {
+        total_items.div_ceil(page_size)
+    };
     let start_index = (page - 1) * page_size;
-
     let paged_items = items.into_iter().skip(start_index).take(page_size).collect();
     PaginatedResponse {
         items: paged_items,
@@ -606,36 +632,65 @@ where
     }
 }
 
-fn empty_hero() -> HeroDto {
-    HeroDto {
-        id: 0,
-        name: String::new(),
-        primary_attr: String::new(),
-        attack_type: String::new(),
-        roles: vec![],
-        img: String::new(),
-        icon: String::new(),
-        health: 0,
-        base_str: 0,
-        base_agi: 0,
-        base_int: 0,
-        base_mana: 0,
-        base_armor: 0.0,
-        base_mr: 0,
-        attack_range: 0,
-        attack_rate: 0.0,
-        move_speed: 0,
-        hover_first: 0,
-        hover_second: 0,
-        hover_third: 0,
+// ── Mapping helpers ───────────────────────────────────────────────────────────
+
+fn map_pro_player(raw: ProPlayerRaw) -> ProPlayerDto {
+    let display_name = raw
+        .name
+        .filter(|s| !s.is_empty())
+        .or(raw.personaname)
+        .unwrap_or_default();
+    ProPlayerDto {
+        account_id: raw.account_id.unwrap_or_default(),
+        name: display_name,
+        team_name: raw.team_name.unwrap_or_default(),
+        team_tag: raw.team_tag.unwrap_or_default(),
+        country_code: raw.country_code.unwrap_or_default(),
+        fantasy_role: raw.fantasy_role.unwrap_or(-1),
+        avatar: raw.avatarfull.unwrap_or_default(),
     }
+}
+
+fn group_team_matchups(matches: Vec<TeamMatchRaw>) -> Vec<TeamMatchupDto> {
+    let mut grouped: HashMap<i64, TeamMatchupDto> = HashMap::new();
+
+    for item in matches {
+        let id = item.opposing_team_id.unwrap_or_default();
+        let entry = grouped.entry(id).or_insert(TeamMatchupDto {
+            id,
+            wins: 0,
+            games_played: 0,
+            win_rate: 0.0,
+            name: item.opposing_team_name.clone().unwrap_or_default(),
+            img: item.opposing_team_logo.clone().unwrap_or_default(),
+            league_name: item.league_name.clone().unwrap_or_default(),
+        });
+
+        if item.radiant == item.radiant_win {
+            entry.wins += 1;
+        }
+        entry.games_played += 1;
+        if entry.games_played > 0 {
+            entry.win_rate = (entry.wins as f64 / entry.games_played as f64) * 100.0;
+        }
+        if entry.name.is_empty() {
+            entry.name = item.opposing_team_name.unwrap_or_default();
+        }
+        if entry.img.is_empty() {
+            entry.img = item.opposing_team_logo.unwrap_or_default();
+        }
+        if entry.league_name.is_empty() {
+            entry.league_name = item.league_name.unwrap_or_default();
+        }
+    }
+
+    grouped.into_values().collect()
 }
 
 fn map_team_card(item: &Value) -> TeamCardDto {
     let rating = value_to_f64(item.get("rating"));
     let wins = value_to_i64(item.get("wins"));
     let losses = value_to_i64(item.get("losses"));
-
     TeamCardDto {
         id: value_to_i64(item.get("team_id")),
         name: value_to_string(item.get("name")),
@@ -661,6 +716,31 @@ fn map_team(item: &Value) -> TeamDto {
         last_match_time: value_to_optional_string(item.get("last_match_time")).unwrap_or_default(),
         tag: value_to_string(item.get("tag")),
         img: value_to_string(item.get("logo_url")),
+    }
+}
+
+fn empty_hero() -> HeroDto {
+    HeroDto {
+        id: 0,
+        name: String::new(),
+        primary_attr: String::new(),
+        attack_type: String::new(),
+        roles: vec![],
+        img: String::new(),
+        icon: String::new(),
+        health: 0,
+        base_str: 0,
+        base_agi: 0,
+        base_int: 0,
+        base_mana: 0,
+        base_armor: 0.0,
+        base_mr: 0,
+        attack_range: 0,
+        attack_rate: 0.0,
+        move_speed: 0,
+        hover_first: 0,
+        hover_second: 0,
+        hover_third: 0,
     }
 }
 
