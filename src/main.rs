@@ -204,6 +204,34 @@ struct MatchupDto {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProPlayerRaw {
+    account_id: Option<i64>,
+    name: Option<String>,
+    personaname: Option<String>,
+    avatarfull: Option<String>,
+    team_name: Option<String>,
+    team_tag: Option<String>,
+    country_code: Option<String>,
+    fantasy_role: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ProPlayerDto {
+    #[serde(rename = "accountId")]
+    account_id: i64,
+    name: String,
+    #[serde(rename = "teamName")]
+    team_name: String,
+    #[serde(rename = "teamTag")]
+    team_tag: String,
+    #[serde(rename = "countryCode")]
+    country_code: String,
+    #[serde(rename = "fantasyRole")]
+    fantasy_role: i64,
+    avatar: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TeamMatchRaw {
     opposing_team_id: Option<i64>,
     opposing_team_name: Option<String>,
@@ -355,16 +383,29 @@ async fn get_hero_matchup(
     Ok(Json(paginate(data, query)))
 }
 
-async fn get_pro_players(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn get_pro_players(
+    State(state): State<AppState>,
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<PaginatedResponse<ProPlayerDto>>, ApiError> {
     let key = "proPlayers";
-    if let Some(cached) = try_get_cache::<Value>(&state, key).await? {
-        return Ok(Json(cached));
-    }
+    let cached = try_get_cache::<Vec<ProPlayerDto>>(&state, key).await?;
+    let players = if let Some(value) = cached {
+        value
+    } else {
+        let url = format!("{}/proPlayers", state.open_dota_api_url);
+        let raw: Vec<ProPlayerRaw> = state.client.get(url).send().await?.json().await?;
+        let mut mapped: Vec<ProPlayerDto> = raw
+            .into_iter()
+            .filter(|p| p.account_id.is_some())
+            .map(map_pro_player)
+            .filter(|p| !p.name.is_empty())
+            .collect();
+        mapped.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        set_cache(&state, key, &mapped).await?;
+        mapped
+    };
 
-    let url = format!("{}/proPlayers", state.open_dota_api_url);
-    let response: Value = state.client.get(url).send().await?.json().await?;
-    set_cache(&state, key, &response).await?;
-    Ok(Json(response))
+    Ok(Json(paginate(players, query)))
 }
 
 async fn get_pro_teams(
@@ -423,6 +464,24 @@ async fn get_team_matchup(
     };
 
     Ok(Json(paginate(matchups, query)))
+}
+
+fn map_pro_player(raw: ProPlayerRaw) -> ProPlayerDto {
+    let display_name = raw
+        .name
+        .filter(|s| !s.is_empty())
+        .or(raw.personaname)
+        .unwrap_or_default();
+
+    ProPlayerDto {
+        account_id: raw.account_id.unwrap_or_default(),
+        name: display_name,
+        team_name: raw.team_name.unwrap_or_default(),
+        team_tag: raw.team_tag.unwrap_or_default(),
+        country_code: raw.country_code.unwrap_or_default(),
+        fantasy_role: raw.fantasy_role.unwrap_or(-1),
+        avatar: raw.avatarfull.unwrap_or_default(),
+    }
 }
 
 fn group_team_matchups(matches: Vec<TeamMatchRaw>) -> Vec<TeamMatchupDto> {
