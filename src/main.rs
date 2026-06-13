@@ -295,6 +295,33 @@ struct HeroBenchmarksDto {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct HeroRankingPlayerDto {
+    #[serde(rename = "accountId")]
+    account_id: i64,
+    name: String,
+    avatar: String,
+    #[serde(rename = "rankTier")]
+    rank_tier: Option<i64>,
+    #[serde(rename = "rankLabel")]
+    rank_label: String,
+    #[serde(rename = "rankIcon")]
+    rank_icon: String,
+    #[serde(rename = "rankStarIcon")]
+    rank_star_icon: String,
+    score: f64,
+    #[serde(rename = "rankPosition")]
+    rank_position: i64,
+    percentile: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct HeroRankingsDto {
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    players: Vec<HeroRankingPlayerDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct PlayerProfileDto {
     #[serde(rename = "accountId")]
     account_id: i64,
@@ -591,6 +618,7 @@ async fn main() {
         .route("/hero/:id", get(get_hero_by_id))
         .route("/hero-matchup/:id", get(get_hero_matchup))
         .route("/hero-benchmarks/:id", get(get_hero_benchmarks))
+        .route("/hero-rankings/:id", get(get_hero_rankings))
         .route("/pro-players", get(get_pro_players))
         .route("/player/:id", get(get_player_by_id))
         .route("/player-recent-matches/:id", get(get_player_recent_matches))
@@ -716,6 +744,14 @@ async fn get_hero_benchmarks(
 ) -> Result<Json<HeroBenchmarksDto>, ApiError> {
     let benchmarks = fetch_hero_benchmarks(&state, id).await?;
     Ok(Json(benchmarks))
+}
+
+async fn get_hero_rankings(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<HeroRankingsDto>, ApiError> {
+    let rankings = fetch_hero_rankings(&state, id).await?;
+    Ok(Json(rankings))
 }
 
 async fn get_pro_players(
@@ -995,6 +1031,63 @@ fn map_hero_benchmarks(hero_id: i64, raw: &Value) -> HeroBenchmarksDto {
         .collect();
 
     HeroBenchmarksDto { hero_id, metrics }
+}
+
+async fn fetch_hero_rankings(
+    state: &AppState,
+    hero_id: i64,
+) -> Result<HeroRankingsDto, ApiError> {
+    let key = format!("heroRankings-{hero_id}");
+    if let Some(cached) = try_get_cache::<HeroRankingsDto>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/rankings?hero_id={hero_id}", state.open_dota_api_url);
+    let raw: Value = fetch_url(&state.client, &url).await?;
+    let dto = map_hero_rankings(hero_id, &raw);
+    set_cache(state, &key, &dto, LIST_TTL).await?;
+    Ok(dto)
+}
+
+fn map_hero_rankings(hero_id: i64, raw: &Value) -> HeroRankingsDto {
+    let rankings = raw
+        .get("rankings")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let total = rankings.len().max(1) as f64;
+    let players: Vec<HeroRankingPlayerDto> = rankings
+        .into_iter()
+        .take(15)
+        .enumerate()
+        .map(|(index, item)| map_hero_ranking_player(&item, index, total))
+        .collect();
+
+    HeroRankingsDto { hero_id, players }
+}
+
+fn map_hero_ranking_player(item: &Value, index: usize, total: f64) -> HeroRankingPlayerDto {
+    let rank_tier = item.get("rank_tier").and_then(|v| v.as_i64());
+    let rank_label = rank_tier_label(rank_tier);
+    let (rank_icon, rank_star_icon) = resolve_rank_icons(rank_tier, None);
+    let position = (index + 1) as i64;
+    let percentile = ((total - index as f64) / total * 100.0).min(100.0);
+
+    HeroRankingPlayerDto {
+        account_id: value_to_i64(item.get("account_id")),
+        name: value_to_non_empty_string(item.get("name"))
+            .or_else(|| value_to_non_empty_string(item.get("personaname")))
+            .unwrap_or_else(|| "Anonymous".to_string()),
+        avatar: value_to_non_empty_string(item.get("avatar")).unwrap_or_default(),
+        rank_tier,
+        rank_label,
+        rank_icon,
+        rank_star_icon,
+        score: value_to_f64(item.get("score")),
+        rank_position: position,
+        percentile,
+    }
 }
 
 fn parse_benchmark_points(value: &Value) -> Vec<BenchmarkPointDto> {
