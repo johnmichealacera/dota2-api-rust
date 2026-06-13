@@ -101,6 +101,11 @@ struct PaginationQuery {
     page_size: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
 #[derive(Debug, Serialize)]
 struct PaginationMeta {
     #[serde(rename = "totalItems")]
@@ -417,6 +422,16 @@ struct TeamHeroDto {
     win_rate: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SearchPlayerDto {
+    #[serde(rename = "accountId")]
+    account_id: i64,
+    name: String,
+    avatar: String,
+    #[serde(rename = "lastMatchTime")]
+    last_match_time: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProMatchRaw {
     match_id: Option<i64>,
@@ -636,6 +651,7 @@ async fn main() {
         .route("/team-players/:id", get(get_team_players))
         .route("/team-heroes/:id", get(get_team_heroes))
         .route("/team-matches/:id", get(get_team_matches))
+        .route("/search", get(get_search))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -897,6 +913,14 @@ async fn get_team_matches(
 ) -> Result<Json<Vec<ProMatchDto>>, ApiError> {
     let matches = fetch_team_matches(&state, id).await?;
     Ok(Json(matches))
+}
+
+async fn get_search(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Vec<SearchPlayerDto>>, ApiError> {
+    let results = fetch_search(&state, &query.q).await?;
+    Ok(Json(results))
 }
 
 // ── Internal fetch functions (shared by handlers + warmup) ────────────────────
@@ -1556,6 +1580,62 @@ fn map_team_match(raw: &TeamMatchRaw, team_name: &str) -> Option<ProMatchDto> {
         radiant_score: raw.radiant_score.unwrap_or_default(),
         dire_score: raw.dire_score.unwrap_or_default(),
         radiant_win,
+    })
+}
+
+async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<SearchPlayerDto>, ApiError> {
+    let trimmed = query.trim();
+    if trimmed.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let key = format!("search-{}", trimmed.to_lowercase());
+    if let Some(cached) = try_get_cache::<Vec<SearchPlayerDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let encoded = encode_query_param(trimmed);
+    let url = format!("{}/search?q={encoded}", state.open_dota_api_url);
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let mapped: Vec<SearchPlayerDto> = raw
+        .into_iter()
+        .filter_map(map_search_player)
+        .take(25)
+        .collect();
+
+    set_cache(state, &key, &mapped, FEED_TTL).await?;
+    Ok(mapped)
+}
+
+fn encode_query_param(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            ' ' => "+".to_string(),
+            _ => format!("%{:02X}", c as u32),
+        })
+        .collect()
+}
+
+fn map_search_player(item: Value) -> Option<SearchPlayerDto> {
+    let account_id = value_to_i64(item.get("account_id"));
+    if account_id <= 0 {
+        return None;
+    }
+
+    let name = value_to_non_empty_string(item.get("personaname"))
+        .or_else(|| value_to_non_empty_string(item.get("name")))
+        .unwrap_or_else(|| "Anonymous".to_string());
+
+    Some(SearchPlayerDto {
+        account_id,
+        name,
+        avatar: value_to_non_empty_string(item.get("avatarfull"))
+            .or_else(|| value_to_non_empty_string(item.get("avatarmedium")))
+            .or_else(|| value_to_non_empty_string(item.get("avatar")))
+            .unwrap_or_default(),
+        last_match_time: value_to_i64(item.get("last_match_time")),
     })
 }
 
