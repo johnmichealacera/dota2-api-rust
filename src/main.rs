@@ -30,6 +30,7 @@ const RANK_ICON_BASE: &str = "https://www.opendota.com/assets/images/dota2/rank_
 const LIST_TTL: Duration = Duration::from_secs(6 * 3600);
 const MATCHUP_TTL: Duration = Duration::from_secs(24 * 3600);
 const FEED_TTL: Duration = Duration::from_secs(5 * 60); // pro matches — high velocity content
+const LIVE_TTL: Duration = Duration::from_secs(2 * 60); // live games — refresh frequently
 const MATCH_TTL: Duration = Duration::from_secs(7 * 24 * 3600); // match details are immutable
 const RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
 
@@ -502,6 +503,51 @@ struct RecordDto {
 }
 
 #[derive(Debug, Deserialize)]
+struct LivePlayerRaw {
+    hero_id: Option<i64>,
+    team: Option<i64>,
+    team_slot: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveGameRaw {
+    match_id: Option<Value>,
+    game_time: Option<i64>,
+    average_mmr: Option<f64>,
+    radiant_score: Option<i64>,
+    dire_score: Option<i64>,
+    players: Option<Vec<LivePlayerRaw>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LiveHeroDto {
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    #[serde(rename = "heroName")]
+    hero_name: String,
+    #[serde(rename = "heroImg")]
+    hero_img: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LiveGameDto {
+    #[serde(rename = "matchId")]
+    match_id: i64,
+    #[serde(rename = "gameTime")]
+    game_time: i64,
+    #[serde(rename = "averageMmr")]
+    average_mmr: f64,
+    #[serde(rename = "radiantScore")]
+    radiant_score: i64,
+    #[serde(rename = "direScore")]
+    dire_score: i64,
+    #[serde(rename = "radiantHeroes")]
+    radiant_heroes: Vec<LiveHeroDto>,
+    #[serde(rename = "direHeroes")]
+    dire_heroes: Vec<LiveHeroDto>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProMatchRaw {
     match_id: Option<i64>,
     duration: Option<i64>,
@@ -725,6 +771,7 @@ async fn main() {
         .route("/league-teams/:id", get(get_league_teams))
         .route("/league-matches/:id", get(get_league_matches))
         .route("/records/:field", get(get_record_by_field))
+        .route("/live", get(get_live_games))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -1041,6 +1088,13 @@ async fn get_record_by_field(
         )
             .into_response()),
     }
+}
+
+async fn get_live_games(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<LiveGameDto>>, ApiError> {
+    let games = fetch_live_games(&state).await?;
+    Ok(Json(games))
 }
 
 // ── Internal fetch functions (shared by handlers + warmup) ────────────────────
@@ -1822,6 +1876,73 @@ fn map_league_match(
         radiant_score: raw.radiant_score.unwrap_or_default(),
         dire_score: raw.dire_score.unwrap_or_default(),
         radiant_win: raw.radiant_win.unwrap_or(false),
+    })
+}
+
+async fn fetch_live_games(state: &AppState) -> Result<Vec<LiveGameDto>, ApiError> {
+    let key = "liveGames";
+    if let Some(cached) = try_get_cache::<Vec<LiveGameDto>>(state, key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/live", state.open_dota_api_url);
+    let raw: Vec<LiveGameRaw> = fetch_url(&state.client, &url).await?;
+    let heroes = fetch_heroes(state).await?;
+    let hero_lookup: HashMap<i64, HeroDto> = heroes.into_iter().map(|h| (h.id, h)).collect();
+
+    let mut mapped: Vec<LiveGameDto> = raw
+        .into_iter()
+        .filter_map(|item| map_live_game(item, &hero_lookup))
+        .collect();
+    mapped.sort_by(|a, b| {
+        b.average_mmr
+            .partial_cmp(&a.average_mmr)
+            .unwrap_or(Ordering::Equal)
+    });
+    mapped.truncate(10);
+    set_cache(state, key, &mapped, LIVE_TTL).await?;
+    Ok(mapped)
+}
+
+fn map_live_game(raw: LiveGameRaw, heroes: &HashMap<i64, HeroDto>) -> Option<LiveGameDto> {
+    let match_id = value_to_i64(raw.match_id.as_ref());
+    if match_id <= 0 {
+        return None;
+    }
+
+    let mut radiant: Vec<(i64, LiveHeroDto)> = Vec::new();
+    let mut dire: Vec<(i64, LiveHeroDto)> = Vec::new();
+
+    for player in raw.players.unwrap_or_default() {
+        let hero_id = player.hero_id.unwrap_or_default();
+        if hero_id <= 0 {
+            continue;
+        }
+        let hero = heroes.get(&hero_id);
+        let dto = LiveHeroDto {
+            hero_id,
+            hero_name: hero.map(|h| h.name.clone()).unwrap_or_default(),
+            hero_img: hero.map(|h| h.img.clone()).unwrap_or_default(),
+        };
+        let slot = player.team_slot.unwrap_or(99);
+        if player.team.unwrap_or(0) == 0 {
+            radiant.push((slot, dto));
+        } else {
+            dire.push((slot, dto));
+        }
+    }
+
+    radiant.sort_by_key(|(slot, _)| *slot);
+    dire.sort_by_key(|(slot, _)| *slot);
+
+    Some(LiveGameDto {
+        match_id,
+        game_time: raw.game_time.unwrap_or_default(),
+        average_mmr: raw.average_mmr.unwrap_or_default(),
+        radiant_score: raw.radiant_score.unwrap_or_default(),
+        dire_score: raw.dire_score.unwrap_or_default(),
+        radiant_heroes: radiant.into_iter().map(|(_, h)| h).collect(),
+        dire_heroes: dire.into_iter().map(|(_, h)| h).collect(),
     })
 }
 
