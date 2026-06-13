@@ -31,6 +31,20 @@ const LIST_TTL: Duration = Duration::from_secs(6 * 3600);
 const MATCHUP_TTL: Duration = Duration::from_secs(24 * 3600);
 const FEED_TTL: Duration = Duration::from_secs(5 * 60); // pro matches — high velocity content
 const MATCH_TTL: Duration = Duration::from_secs(7 * 24 * 3600); // match details are immutable
+const RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
+
+const RECORD_FIELDS: &[&str] = &[
+    "kills",
+    "deaths",
+    "assists",
+    "gold_per_min",
+    "xp_per_min",
+    "last_hits",
+    "tower_damage",
+    "hero_healing",
+    "hero_damage",
+    "duration",
+];
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
@@ -464,6 +478,30 @@ struct LeagueMatchRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct RecordRaw {
+    match_id: Option<i64>,
+    start_time: Option<i64>,
+    hero_id: Option<i64>,
+    score: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RecordDto {
+    field: String,
+    #[serde(rename = "matchId")]
+    match_id: i64,
+    #[serde(rename = "startTime")]
+    start_time: i64,
+    #[serde(rename = "heroId")]
+    hero_id: Option<i64>,
+    #[serde(rename = "heroName")]
+    hero_name: String,
+    #[serde(rename = "heroImg")]
+    hero_img: String,
+    score: f64,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProMatchRaw {
     match_id: Option<i64>,
     duration: Option<i64>,
@@ -686,6 +724,7 @@ async fn main() {
         .route("/leagues", get(get_leagues))
         .route("/league-teams/:id", get(get_league_teams))
         .route("/league-matches/:id", get(get_league_matches))
+        .route("/records/:field", get(get_record_by_field))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -979,6 +1018,29 @@ async fn get_league_matches(
 ) -> Result<Json<Vec<ProMatchDto>>, ApiError> {
     let matches = fetch_league_matches(&state, id).await?;
     Ok(Json(matches))
+}
+
+async fn get_record_by_field(
+    State(state): State<AppState>,
+    Path(field): Path<String>,
+) -> Result<Response, ApiError> {
+    let normalized = field.trim().to_lowercase();
+    if !RECORD_FIELDS.contains(&normalized.as_str()) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid record field" })),
+        )
+            .into_response());
+    }
+
+    match fetch_record(&state, &normalized).await? {
+        Some(record) => Ok(Json(record).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "No record found" })),
+        )
+            .into_response()),
+    }
 }
 
 // ── Internal fetch functions (shared by handlers + warmup) ────────────────────
@@ -1760,6 +1822,41 @@ fn map_league_match(
         radiant_score: raw.radiant_score.unwrap_or_default(),
         dire_score: raw.dire_score.unwrap_or_default(),
         radiant_win: raw.radiant_win.unwrap_or(false),
+    })
+}
+
+async fn fetch_record(state: &AppState, field: &str) -> Result<Option<RecordDto>, ApiError> {
+    let key = format!("record-{field}");
+    if let Some(cached) = try_get_cache::<Option<RecordDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/records/{field}", state.open_dota_api_url);
+    let raw: Vec<RecordRaw> = fetch_url(&state.client, &url).await?;
+    let heroes = fetch_heroes(state).await?;
+    let hero_lookup: HashMap<i64, HeroDto> = heroes.into_iter().map(|h| (h.id, h)).collect();
+    let record = raw.first().and_then(|item| map_record(item, field, &hero_lookup));
+    set_cache(state, &key, &record, RECORD_TTL).await?;
+    Ok(record)
+}
+
+fn map_record(raw: &RecordRaw, field: &str, heroes: &HashMap<i64, HeroDto>) -> Option<RecordDto> {
+    let match_id = raw.match_id?;
+    let hero_id = raw.hero_id.filter(|id| *id > 0);
+    let hero = hero_id.and_then(|id| heroes.get(&id));
+    let score = match raw.score.as_ref() {
+        Some(Value::Number(n)) => n.as_f64().or_else(|| n.as_i64().map(|v| v as f64)).unwrap_or(0.0),
+        other => value_to_f64(other),
+    };
+
+    Some(RecordDto {
+        field: field.to_string(),
+        match_id,
+        start_time: raw.start_time.unwrap_or_default(),
+        hero_id,
+        hero_name: hero.map(|h| h.name.clone()).unwrap_or_default(),
+        hero_img: hero.map(|h| h.img.clone()).unwrap_or_default(),
+        score,
     })
 }
 
