@@ -433,6 +433,37 @@ struct SearchPlayerDto {
 }
 
 #[derive(Debug, Deserialize)]
+struct LeagueRaw {
+    leagueid: Option<i64>,
+    name: Option<String>,
+    tier: Option<String>,
+    banner: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LeagueDto {
+    #[serde(rename = "leagueId")]
+    league_id: i64,
+    name: String,
+    tier: String,
+    banner: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeagueMatchRaw {
+    match_id: Option<i64>,
+    radiant_win: Option<bool>,
+    start_time: Option<i64>,
+    duration: Option<i64>,
+    radiant_score: Option<i64>,
+    dire_score: Option<i64>,
+    radiant_team_id: Option<i64>,
+    radiant_team_name: Option<String>,
+    dire_team_id: Option<i64>,
+    dire_team_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProMatchRaw {
     match_id: Option<i64>,
     duration: Option<i64>,
@@ -652,6 +683,9 @@ async fn main() {
         .route("/team-heroes/:id", get(get_team_heroes))
         .route("/team-matches/:id", get(get_team_matches))
         .route("/search", get(get_search))
+        .route("/leagues", get(get_leagues))
+        .route("/league-teams/:id", get(get_league_teams))
+        .route("/league-matches/:id", get(get_league_matches))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -921,6 +955,30 @@ async fn get_search(
 ) -> Result<Json<Vec<SearchPlayerDto>>, ApiError> {
     let results = fetch_search(&state, &query.q).await?;
     Ok(Json(results))
+}
+
+async fn get_leagues(
+    State(state): State<AppState>,
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<PaginatedResponse<LeagueDto>>, ApiError> {
+    let leagues = fetch_leagues(&state).await?;
+    Ok(Json(paginate(leagues, query)))
+}
+
+async fn get_league_teams(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<TeamCardDto>>, ApiError> {
+    let teams = fetch_league_teams(&state, id).await?;
+    Ok(Json(teams))
+}
+
+async fn get_league_matches(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<ProMatchDto>>, ApiError> {
+    let matches = fetch_league_matches(&state, id).await?;
+    Ok(Json(matches))
 }
 
 // ── Internal fetch functions (shared by handlers + warmup) ────────────────────
@@ -1580,6 +1638,128 @@ fn map_team_match(raw: &TeamMatchRaw, team_name: &str) -> Option<ProMatchDto> {
         radiant_score: raw.radiant_score.unwrap_or_default(),
         dire_score: raw.dire_score.unwrap_or_default(),
         radiant_win,
+    })
+}
+
+async fn fetch_leagues(state: &AppState) -> Result<Vec<LeagueDto>, ApiError> {
+    let key = "leagues";
+    if let Some(cached) = try_get_cache::<Vec<LeagueDto>>(state, key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/leagues", state.open_dota_api_url);
+    let raw: Vec<LeagueRaw> = fetch_url(&state.client, &url).await?;
+    let mut mapped: Vec<LeagueDto> = raw.into_iter().filter_map(map_league).collect();
+    mapped.sort_by(|a, b| b.league_id.cmp(&a.league_id));
+    mapped.truncate(500);
+    set_cache(state, key, &mapped, LIST_TTL).await?;
+    Ok(mapped)
+}
+
+fn map_league(raw: LeagueRaw) -> Option<LeagueDto> {
+    let league_id = raw.leagueid?;
+    let name = raw.name?.trim().to_string();
+    let tier = raw.tier?.trim().to_lowercase();
+
+    if league_id <= 0 || name.len() < 4 {
+        return None;
+    }
+    if !matches!(tier.as_str(), "premium" | "professional" | "amateur") {
+        return None;
+    }
+
+    Some(LeagueDto {
+        league_id,
+        name,
+        tier,
+        banner: raw.banner.filter(|s| !s.is_empty()),
+    })
+}
+
+async fn fetch_league_teams(
+    state: &AppState,
+    league_id: i64,
+) -> Result<Vec<TeamCardDto>, ApiError> {
+    let key = format!("leagueTeams-{league_id}");
+    if let Some(cached) = try_get_cache::<Vec<TeamCardDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/leagues/{league_id}/teams", state.open_dota_api_url);
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let mut mapped: Vec<TeamCardDto> = raw.iter().map(map_team_card).collect();
+    mapped.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap_or(Ordering::Equal));
+    set_cache(state, &key, &mapped, MATCHUP_TTL).await?;
+    Ok(mapped)
+}
+
+async fn fetch_league_matches(
+    state: &AppState,
+    league_id: i64,
+) -> Result<Vec<ProMatchDto>, ApiError> {
+    let key = format!("leagueMatches-{league_id}");
+    if let Some(cached) = try_get_cache::<Vec<ProMatchDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let leagues = fetch_leagues(state).await?;
+    let league_name = leagues
+        .iter()
+        .find(|l| l.league_id == league_id)
+        .map(|l| l.name.clone())
+        .unwrap_or_default();
+
+    let pro_teams = fetch_pro_teams(state).await?;
+    let team_names: HashMap<i64, String> = pro_teams
+        .into_iter()
+        .map(|t| (t.id, t.name))
+        .collect();
+
+    let url = format!("{}/leagues/{league_id}/matches", state.open_dota_api_url);
+    let raw: Vec<LeagueMatchRaw> = fetch_url(&state.client, &url).await?;
+    let mut mapped: Vec<ProMatchDto> = raw
+        .into_iter()
+        .filter_map(|item| map_league_match(item, league_id, &league_name, &team_names))
+        .collect();
+    mapped.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+    mapped.truncate(50);
+    set_cache(state, &key, &mapped, FEED_TTL).await?;
+    Ok(mapped)
+}
+
+fn map_league_match(
+    raw: LeagueMatchRaw,
+    league_id: i64,
+    league_name: &str,
+    teams: &HashMap<i64, String>,
+) -> Option<ProMatchDto> {
+    let match_id = raw.match_id?;
+    let radiant_id = raw.radiant_team_id.unwrap_or_default();
+    let dire_id = raw.dire_team_id.unwrap_or_default();
+    let radiant_name = raw
+        .radiant_team_name
+        .filter(|s| !s.is_empty())
+        .or_else(|| teams.get(&radiant_id).cloned())
+        .unwrap_or_else(|| "Radiant".to_string());
+    let dire_name = raw
+        .dire_team_name
+        .filter(|s| !s.is_empty())
+        .or_else(|| teams.get(&dire_id).cloned())
+        .unwrap_or_else(|| "Dire".to_string());
+
+    Some(ProMatchDto {
+        match_id,
+        duration: raw.duration.unwrap_or_default(),
+        start_time: raw.start_time.unwrap_or_default(),
+        radiant_team_id: radiant_id,
+        radiant_name,
+        dire_team_id: dire_id,
+        dire_name,
+        league_id,
+        league_name: league_name.to_string(),
+        radiant_score: raw.radiant_score.unwrap_or_default(),
+        dire_score: raw.dire_score.unwrap_or_default(),
+        radiant_win: raw.radiant_win.unwrap_or(false),
     })
 }
 
