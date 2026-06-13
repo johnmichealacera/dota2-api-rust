@@ -269,6 +269,30 @@ struct HeroStatDto {
     total_bans: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct BenchmarkPointDto {
+    percentile: f64,
+    value: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct BenchmarkMetricDto {
+    key: String,
+    label: String,
+    points: Vec<BenchmarkPointDto>,
+    p50: f64,
+    p75: f64,
+    p90: f64,
+    max: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct HeroBenchmarksDto {
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    metrics: Vec<BenchmarkMetricDto>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProMatchRaw {
     match_id: Option<i64>,
@@ -469,6 +493,7 @@ async fn main() {
         .route("/hero-stats", get(get_hero_stats))
         .route("/hero/:id", get(get_hero_by_id))
         .route("/hero-matchup/:id", get(get_hero_matchup))
+        .route("/hero-benchmarks/:id", get(get_hero_benchmarks))
         .route("/pro-players", get(get_pro_players))
         .route("/pro-matches", get(get_pro_matches))
         .route("/match/:id", get(get_match_by_id))
@@ -581,6 +606,14 @@ async fn get_hero_matchup(
     };
 
     Ok(Json(paginate(data, query)))
+}
+
+async fn get_hero_benchmarks(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<HeroBenchmarksDto>, ApiError> {
+    let benchmarks = fetch_hero_benchmarks(&state, id).await?;
+    Ok(Json(benchmarks))
 }
 
 async fn get_pro_players(
@@ -768,6 +801,104 @@ async fn fetch_hero_stats(state: &AppState) -> Result<HashMap<String, HeroStatDt
 
     set_cache(state, key, &map, LIST_TTL).await?;
     Ok(map)
+}
+
+async fn fetch_hero_benchmarks(state: &AppState, hero_id: i64) -> Result<HeroBenchmarksDto, ApiError> {
+    let key = format!("heroBenchmarks-{hero_id}");
+    if let Some(cached) = try_get_cache::<HeroBenchmarksDto>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/benchmarks?hero_id={hero_id}", state.open_dota_api_url);
+    let raw: Value = fetch_url(&state.client, &url).await?;
+    let dto = map_hero_benchmarks(hero_id, &raw);
+    set_cache(state, &key, &dto, LIST_TTL).await?;
+    Ok(dto)
+}
+
+fn map_hero_benchmarks(hero_id: i64, raw: &Value) -> HeroBenchmarksDto {
+    const METRICS: &[(&str, &str, &str)] = &[
+        ("gold_per_min", "goldPerMin", "GPM"),
+        ("xp_per_min", "xpPerMin", "XPM"),
+        ("kills_per_min", "killsPerMin", "Kills / min"),
+        ("last_hits_per_min", "lastHitsPerMin", "Last Hits / min"),
+        ("hero_damage_per_min", "heroDamagePerMin", "Hero Damage / min"),
+    ];
+
+    let result = raw.get("result").unwrap_or(raw);
+    let metrics = METRICS
+        .iter()
+        .filter_map(|(raw_key, key, label)| {
+            let points = parse_benchmark_points(result.get(*raw_key)?);
+            if points.is_empty() {
+                return None;
+            }
+            let p50 = percentile_value(&points, 0.5);
+            let p75 = percentile_value(&points, 0.75);
+            let p90 = percentile_value(&points, 0.9);
+            let max = points
+                .iter()
+                .map(|p| p.value)
+                .fold(0.0_f64, f64::max);
+            Some(BenchmarkMetricDto {
+                key: (*key).to_string(),
+                label: (*label).to_string(),
+                points,
+                p50,
+                p75,
+                p90,
+                max,
+            })
+        })
+        .collect();
+
+    HeroBenchmarksDto { hero_id, metrics }
+}
+
+fn parse_benchmark_points(value: &Value) -> Vec<BenchmarkPointDto> {
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+
+    let mut points: Vec<BenchmarkPointDto> = items
+        .iter()
+        .filter_map(|item| {
+            let percentile = item.get("percentile")?.as_f64()?;
+            let value = item.get("value")?.as_f64()?;
+            Some(BenchmarkPointDto { percentile, value })
+        })
+        .collect();
+
+    points.sort_by(|a, b| {
+        a.percentile
+            .partial_cmp(&b.percentile)
+            .unwrap_or(Ordering::Equal)
+    });
+    points
+}
+
+fn percentile_value(points: &[BenchmarkPointDto], target: f64) -> f64 {
+    if points.is_empty() {
+        return 0.0;
+    }
+
+    if target <= points[0].percentile {
+        return points[0].value;
+    }
+
+    for window in points.windows(2) {
+        let prev = &window[0];
+        let next = &window[1];
+        if target <= next.percentile {
+            if next.percentile == prev.percentile {
+                return next.value;
+            }
+            let ratio = (target - prev.percentile) / (next.percentile - prev.percentile);
+            return prev.value + ratio * (next.value - prev.value);
+        }
+    }
+
+    points.last().map(|p| p.value).unwrap_or(0.0)
 }
 
 async fn fetch_pro_players(state: &AppState) -> Result<Vec<ProPlayerDto>, ApiError> {
