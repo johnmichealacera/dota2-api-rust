@@ -356,6 +356,40 @@ struct PlayerHeroStatDto {
     last_played: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct TeamPlayerDto {
+    #[serde(rename = "accountId")]
+    account_id: i64,
+    name: String,
+    #[serde(rename = "gamesPlayed")]
+    games_played: i64,
+    wins: i64,
+    #[serde(rename = "winRate")]
+    win_rate: f64,
+    #[serde(rename = "isCurrent")]
+    is_current: bool,
+    avatar: String,
+    #[serde(rename = "countryCode")]
+    country_code: String,
+    #[serde(rename = "fantasyRole")]
+    fantasy_role: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct TeamHeroDto {
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    #[serde(rename = "heroName")]
+    hero_name: String,
+    #[serde(rename = "heroImg")]
+    hero_img: String,
+    #[serde(rename = "gamesPlayed")]
+    games_played: i64,
+    wins: i64,
+    #[serde(rename = "winRate")]
+    win_rate: f64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProMatchRaw {
     match_id: Option<i64>,
@@ -566,6 +600,8 @@ async fn main() {
         .route("/pro-teams", get(get_pro_teams))
         .route("/team/:id", get(get_team_by_id))
         .route("/team-matchup/:id", get(get_team_matchup))
+        .route("/team-players/:id", get(get_team_players))
+        .route("/team-heroes/:id", get(get_team_heroes))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -795,6 +831,22 @@ async fn get_team_matchup(
     };
 
     Ok(Json(paginate(matchups, query)))
+}
+
+async fn get_team_players(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<TeamPlayerDto>>, ApiError> {
+    let players = fetch_team_players(&state, id).await?;
+    Ok(Json(players))
+}
+
+async fn get_team_heroes(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<TeamHeroDto>>, ApiError> {
+    let heroes = fetch_team_heroes(&state, id).await?;
+    Ok(Json(heroes))
 }
 
 // ── Internal fetch functions (shared by handlers + warmup) ────────────────────
@@ -1229,6 +1281,118 @@ fn rank_tier_label(tier: Option<i64>) -> String {
         name.to_string()
     } else {
         format!("{name} {stars}")
+    }
+}
+
+async fn fetch_team_players(
+    state: &AppState,
+    team_id: i64,
+) -> Result<Vec<TeamPlayerDto>, ApiError> {
+    let key = format!("teamPlayers-{team_id}");
+    if let Some(cached) = try_get_cache::<Vec<TeamPlayerDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/teams/{team_id}/players", state.open_dota_api_url);
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let pro_players = fetch_pro_players(state).await?;
+    let pro_lookup: HashMap<i64, ProPlayerDto> = pro_players
+        .into_iter()
+        .map(|p| (p.account_id, p))
+        .collect();
+
+    let mut mapped: Vec<TeamPlayerDto> = raw
+        .into_iter()
+        .map(|item| map_team_player(&item, &pro_lookup))
+        .collect();
+
+    mapped.sort_by(|a, b| {
+        b.is_current
+            .cmp(&a.is_current)
+            .then(b.games_played.cmp(&a.games_played))
+    });
+
+    set_cache(state, &key, &mapped, LIST_TTL).await?;
+    Ok(mapped)
+}
+
+async fn fetch_team_heroes(
+    state: &AppState,
+    team_id: i64,
+) -> Result<Vec<TeamHeroDto>, ApiError> {
+    let key = format!("teamHeroes-{team_id}");
+    if let Some(cached) = try_get_cache::<Vec<TeamHeroDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/teams/{team_id}/heroes", state.open_dota_api_url);
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let heroes = fetch_heroes(state).await?;
+    let hero_lookup: HashMap<i64, HeroDto> = heroes.into_iter().map(|h| (h.id, h)).collect();
+
+    let mut mapped: Vec<TeamHeroDto> = raw
+        .into_iter()
+        .map(|item| map_team_hero(&item, &hero_lookup))
+        .filter(|h| h.games_played > 0)
+        .collect();
+
+    mapped.sort_by(|a, b| b.games_played.cmp(&a.games_played));
+    mapped.truncate(30);
+
+    set_cache(state, &key, &mapped, LIST_TTL).await?;
+    Ok(mapped)
+}
+
+fn map_team_player(item: &Value, pro_lookup: &HashMap<i64, ProPlayerDto>) -> TeamPlayerDto {
+    let account_id = value_to_i64(item.get("account_id"));
+    let pro = pro_lookup.get(&account_id);
+    let games_played = value_to_i64(item.get("games_played"));
+    let wins = value_to_i64(item.get("wins"));
+    let win_rate = if games_played == 0 {
+        0.0
+    } else {
+        (wins as f64 / games_played as f64) * 100.0
+    };
+
+    TeamPlayerDto {
+        account_id,
+        name: value_to_non_empty_string(item.get("name"))
+            .or_else(|| pro.map(|p| p.name.clone()))
+            .unwrap_or_default(),
+        games_played,
+        wins,
+        win_rate,
+        is_current: item
+            .get("is_current_team_member")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        avatar: pro.map(|p| p.avatar.clone()).unwrap_or_default(),
+        country_code: pro.map(|p| p.country_code.clone()).unwrap_or_default(),
+        fantasy_role: pro.map(|p| p.fantasy_role).unwrap_or(-1),
+    }
+}
+
+fn map_team_hero(item: &Value, heroes: &HashMap<i64, HeroDto>) -> TeamHeroDto {
+    let hero_id = value_to_i64(item.get("hero_id"));
+    let hero = heroes.get(&hero_id);
+    let games_played = value_to_i64(item.get("games_played"));
+    let wins = value_to_i64(item.get("wins"));
+    let win_rate = if games_played == 0 {
+        0.0
+    } else {
+        (wins as f64 / games_played as f64) * 100.0
+    };
+
+    TeamHeroDto {
+        hero_id,
+        hero_name: hero
+            .map(|h| h.name.clone())
+            .or_else(|| value_to_non_empty_string(item.get("localized_name")))
+            .unwrap_or_default(),
+        hero_img: hero.map(|h| h.img.clone()).unwrap_or_default(),
+        games_played,
+        wins,
+        win_rate,
     }
 }
 
