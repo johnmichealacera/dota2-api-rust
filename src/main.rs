@@ -462,6 +462,11 @@ struct ProMatchDto {
 
 #[derive(Debug, Deserialize)]
 struct TeamMatchRaw {
+    match_id: Option<i64>,
+    radiant_score: Option<i64>,
+    dire_score: Option<i64>,
+    duration: Option<i64>,
+    start_time: Option<i64>,
     opposing_team_id: Option<i64>,
     opposing_team_name: Option<String>,
     opposing_team_logo: Option<String>,
@@ -630,6 +635,7 @@ async fn main() {
         .route("/team-matchup/:id", get(get_team_matchup))
         .route("/team-players/:id", get(get_team_players))
         .route("/team-heroes/:id", get(get_team_heroes))
+        .route("/team-matches/:id", get(get_team_matches))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -883,6 +889,14 @@ async fn get_team_heroes(
 ) -> Result<Json<Vec<TeamHeroDto>>, ApiError> {
     let heroes = fetch_team_heroes(&state, id).await?;
     Ok(Json(heroes))
+}
+
+async fn get_team_matches(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<ProMatchDto>>, ApiError> {
+    let matches = fetch_team_matches(&state, id).await?;
+    Ok(Json(matches))
 }
 
 // ── Internal fetch functions (shared by handlers + warmup) ────────────────────
@@ -1487,6 +1501,62 @@ fn map_team_hero(item: &Value, heroes: &HashMap<i64, HeroDto>) -> TeamHeroDto {
         wins,
         win_rate,
     }
+}
+
+async fn fetch_team_matches(
+    state: &AppState,
+    team_id: i64,
+) -> Result<Vec<ProMatchDto>, ApiError> {
+    let key = format!("teamMatches-{team_id}");
+    if let Some(cached) = try_get_cache::<Vec<ProMatchDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let team_url = format!("{}/teams/{team_id}", state.open_dota_api_url);
+    let team: Value = fetch_url(&state.client, &team_url).await?;
+    let team_name = value_to_string(team.get("name"));
+
+    let url = format!("{}/teams/{team_id}/matches", state.open_dota_api_url);
+    let raw: Vec<TeamMatchRaw> = fetch_url(&state.client, &url).await?;
+    let mapped: Vec<ProMatchDto> = raw
+        .into_iter()
+        .filter_map(|item| map_team_match(&item, &team_name))
+        .take(20)
+        .collect();
+
+    set_cache(state, &key, &mapped, FEED_TTL).await?;
+    Ok(mapped)
+}
+
+fn map_team_match(raw: &TeamMatchRaw, team_name: &str) -> Option<ProMatchDto> {
+    let match_id = raw.match_id?;
+    let is_radiant = raw.radiant.unwrap_or(false);
+    let opponent = raw
+        .opposing_team_name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Opponent".to_string());
+    let radiant_win = raw.radiant_win.unwrap_or(false);
+    let (radiant_name, dire_name) = if is_radiant {
+        (team_name.to_string(), opponent)
+    } else {
+        (opponent, team_name.to_string())
+    };
+
+    Some(ProMatchDto {
+        match_id,
+        duration: raw.duration.unwrap_or_default(),
+        start_time: raw.start_time.unwrap_or_default(),
+        radiant_team_id: if is_radiant { 0 } else { raw.opposing_team_id.unwrap_or_default() },
+        radiant_name,
+        dire_team_id: if is_radiant { raw.opposing_team_id.unwrap_or_default() } else { 0 },
+        dire_name,
+        league_id: 0,
+        league_name: raw.league_name.clone().unwrap_or_default(),
+        radiant_score: raw.radiant_score.unwrap_or_default(),
+        dire_score: raw.dire_score.unwrap_or_default(),
+        radiant_win,
+    })
 }
 
 async fn fetch_pro_players(state: &AppState) -> Result<Vec<ProPlayerDto>, ApiError> {
