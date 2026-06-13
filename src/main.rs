@@ -24,6 +24,7 @@ const DEFAULT_OPEN_DOTA_API_URL: &str = "https://api.opendota.com/api";
 const HERO_URL_BASE: &str =
     "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes";
 const ITEM_CDN_BASE: &str = "https://cdn.cloudflare.steamstatic.com";
+const RANK_ICON_BASE: &str = "https://www.opendota.com/assets/images/dota2/rank_icons";
 
 // Cache TTLs — lists refresh every 6 h; per-entity matchup data every 24 h
 const LIST_TTL: Duration = Duration::from_secs(6 * 3600);
@@ -293,6 +294,68 @@ struct HeroBenchmarksDto {
     metrics: Vec<BenchmarkMetricDto>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PlayerProfileDto {
+    #[serde(rename = "accountId")]
+    account_id: i64,
+    name: String,
+    avatar: String,
+    #[serde(rename = "rankTier")]
+    rank_tier: Option<i64>,
+    #[serde(rename = "rankLabel")]
+    rank_label: String,
+    #[serde(rename = "rankIcon")]
+    rank_icon: String,
+    #[serde(rename = "rankStarIcon")]
+    rank_star_icon: String,
+    #[serde(rename = "leaderboardRank")]
+    leaderboard_rank: Option<i64>,
+    mmr: Option<i64>,
+    wins: i64,
+    losses: i64,
+    #[serde(rename = "winRate")]
+    win_rate: f64,
+    #[serde(rename = "teamName")]
+    team_name: String,
+    #[serde(rename = "countryCode")]
+    country_code: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PlayerRecentMatchDto {
+    #[serde(rename = "matchId")]
+    match_id: i64,
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    #[serde(rename = "heroName")]
+    hero_name: String,
+    #[serde(rename = "heroImg")]
+    hero_img: String,
+    kills: i64,
+    deaths: i64,
+    assists: i64,
+    duration: i64,
+    #[serde(rename = "startTime")]
+    start_time: i64,
+    won: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PlayerHeroStatDto {
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    #[serde(rename = "heroName")]
+    hero_name: String,
+    #[serde(rename = "heroImg")]
+    hero_img: String,
+    games: i64,
+    wins: i64,
+    #[serde(rename = "winRate")]
+    win_rate: f64,
+    #[serde(rename = "lastPlayed")]
+    last_played: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProMatchRaw {
     match_id: Option<i64>,
@@ -495,6 +558,9 @@ async fn main() {
         .route("/hero-matchup/:id", get(get_hero_matchup))
         .route("/hero-benchmarks/:id", get(get_hero_benchmarks))
         .route("/pro-players", get(get_pro_players))
+        .route("/player/:id", get(get_player_by_id))
+        .route("/player-recent-matches/:id", get(get_player_recent_matches))
+        .route("/player-heroes/:id", get(get_player_heroes))
         .route("/pro-matches", get(get_pro_matches))
         .route("/match/:id", get(get_match_by_id))
         .route("/pro-teams", get(get_pro_teams))
@@ -622,6 +688,30 @@ async fn get_pro_players(
 ) -> Result<Json<PaginatedResponse<ProPlayerDto>>, ApiError> {
     let players = fetch_pro_players(&state).await?;
     Ok(Json(paginate(players, query)))
+}
+
+async fn get_player_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<PlayerProfileDto>, ApiError> {
+    let profile = fetch_player_profile(&state, id).await?;
+    Ok(Json(profile))
+}
+
+async fn get_player_recent_matches(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<PlayerRecentMatchDto>>, ApiError> {
+    let matches = fetch_player_recent_matches(&state, id).await?;
+    Ok(Json(matches))
+}
+
+async fn get_player_heroes(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<PlayerHeroStatDto>>, ApiError> {
+    let heroes = fetch_player_heroes(&state, id).await?;
+    Ok(Json(heroes))
 }
 
 async fn get_pro_matches(
@@ -899,6 +989,247 @@ fn percentile_value(points: &[BenchmarkPointDto], target: f64) -> f64 {
     }
 
     points.last().map(|p| p.value).unwrap_or(0.0)
+}
+
+async fn fetch_player_profile(
+    state: &AppState,
+    account_id: i64,
+) -> Result<PlayerProfileDto, ApiError> {
+    let key = format!("playerProfile-{account_id}");
+    if let Some(cached) = try_get_cache::<PlayerProfileDto>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let profile_url = format!("{}/players/{account_id}", state.open_dota_api_url);
+    let wl_url = format!("{}/players/{account_id}/wl", state.open_dota_api_url);
+    let profile_raw: Value = fetch_url(&state.client, &profile_url).await?;
+    let wl_raw: Value = fetch_url(&state.client, &wl_url).await?;
+    let pro_players = fetch_pro_players(state).await?;
+    let pro = pro_players.iter().find(|p| p.account_id == account_id);
+    let dto = map_player_profile(account_id, &profile_raw, &wl_raw, pro);
+    set_cache(state, &key, &dto, LIST_TTL).await?;
+    Ok(dto)
+}
+
+async fn fetch_player_recent_matches(
+    state: &AppState,
+    account_id: i64,
+) -> Result<Vec<PlayerRecentMatchDto>, ApiError> {
+    let key = format!("playerRecent-{account_id}");
+    if let Some(cached) = try_get_cache::<Vec<PlayerRecentMatchDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!(
+        "{}/players/{account_id}/recentMatches",
+        state.open_dota_api_url
+    );
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let heroes = fetch_heroes(state).await?;
+    let hero_lookup: HashMap<i64, HeroDto> = heroes.into_iter().map(|h| (h.id, h)).collect();
+    let mapped: Vec<PlayerRecentMatchDto> = raw
+        .into_iter()
+        .map(|item| map_player_recent_match(&item, &hero_lookup))
+        .collect();
+    set_cache(state, &key, &mapped, FEED_TTL).await?;
+    Ok(mapped)
+}
+
+async fn fetch_player_heroes(
+    state: &AppState,
+    account_id: i64,
+) -> Result<Vec<PlayerHeroStatDto>, ApiError> {
+    let key = format!("playerHeroes-{account_id}");
+    if let Some(cached) = try_get_cache::<Vec<PlayerHeroStatDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/players/{account_id}/heroes", state.open_dota_api_url);
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let heroes = fetch_heroes(state).await?;
+    let hero_lookup: HashMap<i64, HeroDto> = heroes.into_iter().map(|h| (h.id, h)).collect();
+    let mut mapped: Vec<PlayerHeroStatDto> = raw
+        .into_iter()
+        .map(|item| map_player_hero_stat(&item, &hero_lookup))
+        .filter(|h| h.games > 0)
+        .collect();
+    mapped.sort_by(|a, b| b.games.cmp(&a.games));
+    mapped.truncate(25);
+    set_cache(state, &key, &mapped, LIST_TTL).await?;
+    Ok(mapped)
+}
+
+fn map_player_profile(
+    account_id: i64,
+    raw: &Value,
+    wl: &Value,
+    pro: Option<&ProPlayerDto>,
+) -> PlayerProfileDto {
+    let profile = raw.get("profile");
+    let name = profile
+        .and_then(|p| value_to_non_empty_string(p.get("personaname")))
+        .or_else(|| profile.and_then(|p| value_to_non_empty_string(p.get("name"))))
+        .or_else(|| pro.map(|p| p.name.clone()))
+        .unwrap_or_else(|| "Anonymous".to_string());
+
+    let avatar = profile
+        .and_then(|p| value_to_non_empty_string(p.get("avatarfull")))
+        .or_else(|| pro.map(|p| p.avatar.clone()))
+        .unwrap_or_default();
+
+    let country_code = profile
+        .and_then(|p| value_to_non_empty_string(p.get("loccountrycode")))
+        .or_else(|| pro.map(|p| p.country_code.clone()))
+        .unwrap_or_default();
+
+    let rank_tier = raw.get("rank_tier").and_then(|v| v.as_i64());
+    let leaderboard_rank = raw.get("leaderboard_rank").and_then(|v| v.as_i64());
+    let rank_label = rank_tier_label(rank_tier);
+    let (rank_icon, rank_star_icon) = resolve_rank_icons(rank_tier, leaderboard_rank);
+
+    let mmr = raw
+        .get("mmr_estimate")
+        .and_then(|v| v.get("estimate"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| raw.get("computed_mmr").and_then(|v| v.as_i64()));
+
+    let wins = value_to_i64(wl.get("win"));
+    let losses = value_to_i64(wl.get("lose"));
+    let total = wins + losses;
+    let win_rate = if total == 0 {
+        0.0
+    } else {
+        (wins as f64 / total as f64) * 100.0
+    };
+
+    PlayerProfileDto {
+        account_id,
+        name,
+        avatar,
+        rank_tier,
+        rank_label,
+        rank_icon,
+        rank_star_icon,
+        leaderboard_rank,
+        mmr,
+        wins,
+        losses,
+        win_rate,
+        team_name: pro.map(|p| p.team_name.clone()).unwrap_or_default(),
+        country_code,
+    }
+}
+
+fn map_player_recent_match(raw: &Value, heroes: &HashMap<i64, HeroDto>) -> PlayerRecentMatchDto {
+    let hero_id = value_to_i64(raw.get("hero_id"));
+    let hero = heroes.get(&hero_id);
+    let slot = value_to_i64(raw.get("player_slot"));
+    let radiant = slot < 128;
+    let radiant_win = raw.get("radiant_win").and_then(|v| v.as_bool()).unwrap_or(false);
+    let won = radiant == radiant_win;
+
+    PlayerRecentMatchDto {
+        match_id: value_to_i64(raw.get("match_id")),
+        hero_id,
+        hero_name: hero.map(|h| h.name.clone()).unwrap_or_default(),
+        hero_img: hero.map(|h| h.img.clone()).unwrap_or_default(),
+        kills: value_to_i64(raw.get("kills")),
+        deaths: value_to_i64(raw.get("deaths")),
+        assists: value_to_i64(raw.get("assists")),
+        duration: value_to_i64(raw.get("duration")),
+        start_time: value_to_i64(raw.get("start_time")),
+        won,
+    }
+}
+
+fn map_player_hero_stat(raw: &Value, heroes: &HashMap<i64, HeroDto>) -> PlayerHeroStatDto {
+    let hero_id = value_to_i64(raw.get("hero_id"));
+    let hero = heroes.get(&hero_id);
+    let games = value_to_i64(raw.get("games"));
+    let wins = value_to_i64(raw.get("win"));
+    let win_rate = if games == 0 {
+        0.0
+    } else {
+        (wins as f64 / games as f64) * 100.0
+    };
+
+    PlayerHeroStatDto {
+        hero_id,
+        hero_name: hero.map(|h| h.name.clone()).unwrap_or_default(),
+        hero_img: hero.map(|h| h.img.clone()).unwrap_or_default(),
+        games,
+        wins,
+        win_rate,
+        last_played: value_to_i64(raw.get("last_played")),
+    }
+}
+
+fn resolve_rank_icons(rank_tier: Option<i64>, leaderboard_rank: Option<i64>) -> (String, String) {
+    let Some(tier) = rank_tier.filter(|t| *t > 0) else {
+        return (String::new(), String::new());
+    };
+
+    if tier >= 80 {
+        let medal = if let Some(rank) = leaderboard_rank.filter(|r| *r > 0) {
+            if rank <= 10 {
+                format!("{RANK_ICON_BASE}/rank_icon_8c.png")
+            } else if rank <= 100 {
+                format!("{RANK_ICON_BASE}/rank_icon_8b.png")
+            } else {
+                format!("{RANK_ICON_BASE}/rank_icon_8.png")
+            }
+        } else {
+            format!("{RANK_ICON_BASE}/rank_icon_8.png")
+        };
+        return (medal, String::new());
+    }
+
+    let medal_digit = tier / 10;
+    let mut star = tier % 10;
+    if star < 1 {
+        star = 1;
+    } else if star > 7 {
+        star = 7;
+    }
+
+    let medal = format!("{RANK_ICON_BASE}/rank_icon_{medal_digit}.png");
+    let star_icon = if medal_digit == 8 {
+        String::new()
+    } else {
+        format!("{RANK_ICON_BASE}/rank_star_{star}.png")
+    };
+
+    (medal, star_icon)
+}
+
+fn rank_tier_label(tier: Option<i64>) -> String {
+    let Some(tier) = tier else {
+        return "Unranked".to_string();
+    };
+
+    if tier >= 80 {
+        return "Immortal".to_string();
+    }
+
+    let medal = tier / 10;
+    let stars = tier % 10;
+    let name = match medal {
+        1 => "Herald",
+        2 => "Guardian",
+        3 => "Crusader",
+        4 => "Archon",
+        5 => "Legend",
+        6 => "Ancient",
+        7 => "Divine",
+        8 => "Immortal",
+        _ => "Unknown",
+    };
+
+    if stars == 0 {
+        name.to_string()
+    } else {
+        format!("{name} {stars}")
+    }
 }
 
 async fn fetch_pro_players(state: &AppState) -> Result<Vec<ProPlayerDto>, ApiError> {
