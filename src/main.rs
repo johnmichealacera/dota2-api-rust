@@ -621,8 +621,13 @@ async fn get_match_by_id(
     let raw: Value = fetch_url(&state.client, &url).await?;
     let heroes = fetch_heroes(&state).await?;
     let items = fetch_items(&state).await?;
+    let pro_players = fetch_pro_players(&state).await?;
     let hero_lookup: HashMap<i64, HeroDto> = heroes.into_iter().map(|h| (h.id, h)).collect();
-    let dto = map_match_detail(&raw, &hero_lookup, &items);
+    let pro_names: HashMap<i64, String> = pro_players
+        .into_iter()
+        .map(|p| (p.account_id, p.name))
+        .collect();
+    let dto = map_match_detail(&raw, &hero_lookup, &items, &pro_names);
     set_cache(&state, &key, &dto, MATCH_TTL).await?;
     Ok(Json(dto))
 }
@@ -875,6 +880,7 @@ fn map_match_detail(
     raw: &Value,
     heroes: &HashMap<i64, HeroDto>,
     items: &HashMap<i64, MatchItemDto>,
+    pro_names: &HashMap<i64, String>,
 ) -> MatchDetailDto {
     let mut radiant_players: Vec<MatchPlayerDto> = Vec::new();
     let mut dire_players: Vec<MatchPlayerDto> = Vec::new();
@@ -887,13 +893,7 @@ fn map_match_detail(
             let hero = heroes.get(&hero_id);
             let mapped = MatchPlayerDto {
                 account_id: value_to_i64(player.get("account_id")),
-                name: player
-                    .get("name")
-                    .or(player.get("personaname"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("Anonymous")
-                    .to_string(),
+                name: resolve_player_name(player, pro_names),
                 hero_id,
                 hero_name: hero.map(|h| h.name.clone()).unwrap_or_default(),
                 hero_img: hero.map(|h| h.img.clone()).unwrap_or_default(),
@@ -942,6 +942,32 @@ fn map_match_detail(
         game_mode: game_mode_name(game_mode_id).to_string(),
         radiant: radiant_players,
         dire: dire_players,
+    }
+}
+
+fn resolve_player_name(player: &Value, pro_names: &HashMap<i64, String>) -> String {
+    for key in ["name", "personaname", "player_name"] {
+        if let Some(name) = value_to_non_empty_string(player.get(key)) {
+            return name;
+        }
+    }
+
+    let account_id = value_to_i64(player.get("account_id"));
+    if account_id > 0 {
+        if let Some(name) = pro_names.get(&account_id) {
+            if !name.is_empty() {
+                return name.clone();
+            }
+        }
+    }
+
+    "Anonymous".to_string()
+}
+
+fn value_to_non_empty_string(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
     }
 }
 
