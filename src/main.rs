@@ -23,11 +23,13 @@ use tracing::{error, info};
 const DEFAULT_OPEN_DOTA_API_URL: &str = "https://api.opendota.com/api";
 const HERO_URL_BASE: &str =
     "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes";
+const ITEM_CDN_BASE: &str = "https://cdn.cloudflare.steamstatic.com";
 
 // Cache TTLs — lists refresh every 6 h; per-entity matchup data every 24 h
 const LIST_TTL: Duration = Duration::from_secs(6 * 3600);
 const MATCHUP_TTL: Duration = Duration::from_secs(24 * 3600);
 const FEED_TTL: Duration = Duration::from_secs(5 * 60); // pro matches — high velocity content
+const MATCH_TTL: Duration = Duration::from_secs(7 * 24 * 3600); // match details are immutable
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
@@ -321,6 +323,63 @@ struct TeamMatchRaw {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct MatchItemDto {
+    id: i64,
+    name: String,
+    img: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct MatchPlayerDto {
+    #[serde(rename = "accountId")]
+    account_id: i64,
+    name: String,
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    #[serde(rename = "heroName")]
+    hero_name: String,
+    #[serde(rename = "heroImg")]
+    hero_img: String,
+    kills: i64,
+    deaths: i64,
+    assists: i64,
+    gpm: i64,
+    xpm: i64,
+    #[serde(rename = "netWorth")]
+    net_worth: i64,
+    items: Vec<MatchItemDto>,
+    radiant: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct MatchDetailDto {
+    #[serde(rename = "matchId")]
+    match_id: i64,
+    duration: i64,
+    #[serde(rename = "startTime")]
+    start_time: i64,
+    #[serde(rename = "radiantWin")]
+    radiant_win: bool,
+    #[serde(rename = "radiantScore")]
+    radiant_score: i64,
+    #[serde(rename = "direScore")]
+    dire_score: i64,
+    #[serde(rename = "radiantName")]
+    radiant_name: String,
+    #[serde(rename = "direName")]
+    dire_name: String,
+    #[serde(rename = "leagueId")]
+    league_id: i64,
+    #[serde(rename = "leagueName")]
+    league_name: String,
+    patch: i64,
+    #[serde(rename = "gameMode")]
+    game_mode: String,
+    radiant: Vec<MatchPlayerDto>,
+    dire: Vec<MatchPlayerDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct TeamMatchupDto {
     id: i64,
     wins: i64,
@@ -412,6 +471,7 @@ async fn main() {
         .route("/hero-matchup/:id", get(get_hero_matchup))
         .route("/pro-players", get(get_pro_players))
         .route("/pro-matches", get(get_pro_matches))
+        .route("/match/:id", get(get_match_by_id))
         .route("/pro-teams", get(get_pro_teams))
         .route("/team/:id", get(get_team_by_id))
         .route("/team-matchup/:id", get(get_team_matchup))
@@ -548,6 +608,25 @@ async fn get_pro_matches(
     Ok(Json(paginate(matches, query)))
 }
 
+async fn get_match_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<MatchDetailDto>, ApiError> {
+    let key = format!("matchDetail-{id}");
+    if let Some(cached) = try_get_cache::<MatchDetailDto>(&state, &key).await? {
+        return Ok(Json(cached));
+    }
+
+    let url = format!("{}/matches/{id}", state.open_dota_api_url);
+    let raw: Value = fetch_url(&state.client, &url).await?;
+    let heroes = fetch_heroes(&state).await?;
+    let items = fetch_items(&state).await?;
+    let hero_lookup: HashMap<i64, HeroDto> = heroes.into_iter().map(|h| (h.id, h)).collect();
+    let dto = map_match_detail(&raw, &hero_lookup, &items);
+    set_cache(&state, &key, &dto, MATCH_TTL).await?;
+    Ok(Json(dto))
+}
+
 async fn get_pro_teams(
     State(state): State<AppState>,
     Query(query): Query<PaginationQuery>,
@@ -591,6 +670,30 @@ async fn get_team_matchup(
 }
 
 // ── Internal fetch functions (shared by handlers + warmup) ────────────────────
+
+async fn fetch_items(state: &AppState) -> Result<HashMap<i64, MatchItemDto>, ApiError> {
+    let key = "dotaItems";
+    if let Some(cached) = try_get_cache::<HashMap<i64, MatchItemDto>>(state, key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/constants/items", state.open_dota_api_url);
+    let payload: HashMap<String, Value> = fetch_url(&state.client, &url).await?;
+    let mut items = HashMap::new();
+
+    for item in payload.values() {
+        let id = value_to_i64(item.get("id"));
+        if id <= 0 {
+            continue;
+        }
+        let name = value_to_string(item.get("dname"));
+        let img = build_item_img_url(&value_to_string(item.get("img")));
+        items.insert(id, MatchItemDto { id, name, img });
+    }
+
+    set_cache(state, key, &items, LIST_TTL).await?;
+    Ok(items)
+}
 
 async fn fetch_heroes(state: &AppState) -> Result<Vec<HeroDto>, ApiError> {
     let key = "dotaHeroes";
@@ -768,6 +871,132 @@ fn paginate<T: Clone>(items: Vec<T>, query: PaginationQuery) -> PaginatedRespons
 
 // ── Mapping helpers ───────────────────────────────────────────────────────────
 
+fn map_match_detail(
+    raw: &Value,
+    heroes: &HashMap<i64, HeroDto>,
+    items: &HashMap<i64, MatchItemDto>,
+) -> MatchDetailDto {
+    let mut radiant_players: Vec<MatchPlayerDto> = Vec::new();
+    let mut dire_players: Vec<MatchPlayerDto> = Vec::new();
+
+    if let Some(players) = raw.get("players").and_then(|v| v.as_array()) {
+        for player in players {
+            let slot = value_to_i64(player.get("player_slot"));
+            let is_radiant = slot < 128;
+            let hero_id = value_to_i64(player.get("hero_id"));
+            let hero = heroes.get(&hero_id);
+            let mapped = MatchPlayerDto {
+                account_id: value_to_i64(player.get("account_id")),
+                name: player
+                    .get("name")
+                    .or(player.get("personaname"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Anonymous")
+                    .to_string(),
+                hero_id,
+                hero_name: hero.map(|h| h.name.clone()).unwrap_or_default(),
+                hero_img: hero.map(|h| h.img.clone()).unwrap_or_default(),
+                kills: value_to_i64(player.get("kills")),
+                deaths: value_to_i64(player.get("deaths")),
+                assists: value_to_i64(player.get("assists")),
+                gpm: value_to_i64(player.get("gold_per_min")),
+                xpm: value_to_i64(player.get("xp_per_min")),
+                net_worth: value_to_i64(player.get("net_worth")),
+                items: collect_player_items(player, items),
+                radiant: is_radiant,
+            };
+            if is_radiant {
+                radiant_players.push(mapped);
+            } else {
+                dire_players.push(mapped);
+            }
+        }
+    }
+
+    radiant_players.sort_by_key(|p| p.account_id);
+    dire_players.sort_by_key(|p| p.account_id);
+
+    let game_mode_id = value_to_i64(raw.get("game_mode"));
+    MatchDetailDto {
+        match_id: value_to_i64(raw.get("match_id")),
+        duration: value_to_i64(raw.get("duration")),
+        start_time: value_to_i64(raw.get("start_time")),
+        radiant_win: raw
+            .get("radiant_win")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        radiant_score: value_to_i64(raw.get("radiant_score")),
+        dire_score: value_to_i64(raw.get("dire_score")),
+        radiant_name: {
+            let name = value_to_string(raw.get("radiant_name"));
+            if name.is_empty() { "Radiant".to_string() } else { name }
+        },
+        dire_name: {
+            let name = value_to_string(raw.get("dire_name"));
+            if name.is_empty() { "Dire".to_string() } else { name }
+        },
+        league_id: value_to_i64(raw.get("leagueid")),
+        league_name: value_to_string(raw.get("league_name")),
+        patch: value_to_i64(raw.get("patch")),
+        game_mode: game_mode_name(game_mode_id).to_string(),
+        radiant: radiant_players,
+        dire: dire_players,
+    }
+}
+
+fn collect_player_items(player: &Value, items: &HashMap<i64, MatchItemDto>) -> Vec<MatchItemDto> {
+    ["item_0", "item_1", "item_2", "item_3", "item_4", "item_5"]
+        .iter()
+        .filter_map(|key| {
+            let id = value_to_i64(player.get(*key));
+            if id <= 0 {
+                return None;
+            }
+            items.get(&id).cloned().or_else(|| {
+                Some(MatchItemDto {
+                    id,
+                    name: format!("Item {id}"),
+                    img: String::new(),
+                })
+            })
+        })
+        .collect()
+}
+
+fn build_item_img_url(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return path.to_string();
+    }
+    let clean = path.split('?').next().unwrap_or(path);
+    if clean.starts_with('/') {
+        format!("{ITEM_CDN_BASE}{clean}")
+    } else {
+        format!("{ITEM_CDN_BASE}/{clean}")
+    }
+}
+
+fn game_mode_name(mode: i64) -> &'static str {
+    match mode {
+        0 => "Unknown",
+        1 => "All Pick",
+        2 => "Captains Mode",
+        3 => "Random Draft",
+        4 => "Single Draft",
+        5 => "All Random",
+        11 => "Mid Only",
+        12 => "Least Played",
+        13 => "Limited Heroes",
+        16 => "Captains Draft",
+        22 => "Ranked All Pick",
+        23 => "Turbo",
+        _ => "Other",
+    }
+}
+
 fn map_pro_match(raw: ProMatchRaw) -> Option<ProMatchDto> {
     let match_id = raw.match_id?;
     Some(ProMatchDto {
@@ -917,7 +1146,8 @@ fn value_to_string(value: Option<&Value>) -> String {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
+        Some(Value::Null) | None => String::new(),
+        Some(v) => v.to_string(),
     }
 }
 

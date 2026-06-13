@@ -8,6 +8,8 @@ Rust conversion of the Node.js Dota API backend, preserving the existing REST co
 - `GET /hero/:id`
 - `GET /hero-matchup/:id?page=1&pageSize=18`
 - `GET /pro-players`
+- `GET /pro-matches?page=1&pageSize=30`
+- `GET /match/:id`
 - `GET /pro-teams?page=1&pageSize=30`
 - `GET /team/:id`
 - `GET /team-matchup/:id?page=1&pageSize=18`
