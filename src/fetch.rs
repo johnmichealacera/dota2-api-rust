@@ -1159,6 +1159,70 @@ pub fn map_record(raw: &RecordRaw, field: &str, heroes: &HashMap<i64, HeroDto>) 
     })
 }
 
+pub async fn fetch_global_search(state: &AppState, query: &str) -> Result<GlobalSearchDto, ApiError> {
+    let trimmed = query.trim();
+    if trimmed.len() < 2 {
+        return Ok(GlobalSearchDto {
+            heroes: Vec::new(),
+            teams: Vec::new(),
+            players: Vec::new(),
+        });
+    }
+
+    let needle = trimmed.to_lowercase();
+    let heroes = fetch_heroes(state).await?;
+    let teams = fetch_pro_teams(state).await?;
+    let players = fetch_pro_players(state).await?;
+
+    let hero_hits: Vec<GlobalSearchHeroDto> = heroes
+        .into_iter()
+        .filter(|h| h.name.to_lowercase().contains(&needle))
+        .take(12)
+        .map(|h| GlobalSearchHeroDto {
+            id: h.id,
+            name: h.name,
+            img: h.img,
+        })
+        .collect();
+
+    let team_hits: Vec<GlobalSearchTeamDto> = teams
+        .into_iter()
+        .filter(|t| {
+            t.name.to_lowercase().contains(&needle)
+                || t.tag.to_lowercase().contains(&needle)
+        })
+        .take(12)
+        .map(|t| GlobalSearchTeamDto {
+            id: t.id,
+            name: t.name,
+            img: t.img,
+            tag: t.tag,
+        })
+        .collect();
+
+    let player_hits: Vec<GlobalSearchPlayerDto> = players
+        .into_iter()
+        .filter(|p| {
+            p.name.to_lowercase().contains(&needle)
+                || p.team_name.to_lowercase().contains(&needle)
+                || p.team_tag.to_lowercase().contains(&needle)
+        })
+        .take(12)
+        .map(|p| GlobalSearchPlayerDto {
+            account_id: p.account_id,
+            name: p.name,
+            avatar: p.avatar,
+            team_name: p.team_name,
+        })
+        .collect();
+
+    Ok(GlobalSearchDto {
+        heroes: hero_hits,
+        teams: team_hits,
+        players: player_hits,
+    })
+}
+
 pub async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<SearchPlayerDto>, ApiError> {
     let trimmed = query.trim();
     if trimmed.len() < 2 {

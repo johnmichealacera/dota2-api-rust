@@ -302,6 +302,14 @@ pub async fn get_search(
     Ok(Json(results))
 }
 
+pub async fn get_global_search(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<GlobalSearchDto>, ApiError> {
+    let results = fetch_global_search(&state, &query.q).await?;
+    Ok(Json(results))
+}
+
 pub async fn get_leagues(
     State(state): State<AppState>,
     Query(query): Query<PaginationQuery>,

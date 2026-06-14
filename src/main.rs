@@ -119,6 +119,7 @@ async fn main() {
         .route("/team-heroes/:id", get(get_team_heroes))
         .route("/team-matches/:id", get(get_team_matches))
         .route("/search", get(get_search))
+        .route("/global-search", get(get_global_search))
         .route("/leagues", get(get_leagues))
         .route("/league-teams/:id", get(get_league_teams))
         .route("/league-matches/:id", get(get_league_matches))

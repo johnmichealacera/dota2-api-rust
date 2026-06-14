@@ -632,3 +632,35 @@ pub struct TeamMatchupDto {
     #[serde(rename = "leagueName")]
     pub league_name: String,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GlobalSearchHeroDto {
+    pub id: i64,
+    pub name: String,
+    pub img: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GlobalSearchTeamDto {
+    pub id: i64,
+    pub name: String,
+    pub img: String,
+    pub tag: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GlobalSearchPlayerDto {
+    #[serde(rename = "accountId")]
+    pub account_id: i64,
+    pub name: String,
+    pub avatar: String,
+    #[serde(rename = "teamName")]
+    pub team_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GlobalSearchDto {
+    pub heroes: Vec<GlobalSearchHeroDto>,
+    pub teams: Vec<GlobalSearchTeamDto>,
+    pub players: Vec<GlobalSearchPlayerDto>,
+}
