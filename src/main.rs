@@ -320,6 +320,53 @@ struct HeroBenchmarksDto {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct ItemTimingDto {
+    item: String,
+    #[serde(rename = "itemName")]
+    item_name: String,
+    #[serde(rename = "itemImg")]
+    item_img: String,
+    #[serde(rename = "timeSecs")]
+    time_secs: i64,
+    #[serde(rename = "timeLabel")]
+    time_label: String,
+    games: i64,
+    wins: i64,
+    #[serde(rename = "winRate")]
+    win_rate: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ItemTimingsDto {
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    timings: Vec<ItemTimingDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LaneRoleTimingDto {
+    #[serde(rename = "laneRole")]
+    lane_role: i64,
+    #[serde(rename = "laneLabel")]
+    lane_label: String,
+    #[serde(rename = "timeSecs")]
+    time_secs: i64,
+    #[serde(rename = "timeLabel")]
+    time_label: String,
+    games: i64,
+    wins: i64,
+    #[serde(rename = "winRate")]
+    win_rate: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LaneRolesDto {
+    #[serde(rename = "heroId")]
+    hero_id: i64,
+    roles: Vec<LaneRoleTimingDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct HeroRankingPlayerDto {
     #[serde(rename = "accountId")]
     account_id: i64,
@@ -771,6 +818,8 @@ async fn main() {
         .route("/hero-matchup/:id", get(get_hero_matchup))
         .route("/hero-benchmarks/:id", get(get_hero_benchmarks))
         .route("/hero-rankings/:id", get(get_hero_rankings))
+        .route("/item-timings/:id", get(get_item_timings))
+        .route("/lane-roles/:id", get(get_lane_roles))
         .route("/pro-players", get(get_pro_players))
         .route("/player/:id", get(get_player_by_id))
         .route("/player-recent-matches/:id", get(get_player_recent_matches))
@@ -914,6 +963,22 @@ async fn get_hero_rankings(
 ) -> Result<Json<HeroRankingsDto>, ApiError> {
     let rankings = fetch_hero_rankings(&state, id).await?;
     Ok(Json(rankings))
+}
+
+async fn get_item_timings(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<ItemTimingsDto>, ApiError> {
+    let timings = fetch_item_timings(&state, id).await?;
+    Ok(Json(timings))
+}
+
+async fn get_lane_roles(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<LaneRolesDto>, ApiError> {
+    let roles = fetch_lane_roles(&state, id).await?;
+    Ok(Json(roles))
 }
 
 async fn get_pro_players(
@@ -1133,22 +1198,193 @@ async fn fetch_items(state: &AppState) -> Result<HashMap<i64, MatchItemDto>, Api
         return Ok(cached);
     }
 
+    let (items, _) = load_item_constants(state).await?;
+    set_cache(state, key, &items, LIST_TTL).await?;
+    Ok(items)
+}
+
+async fn fetch_items_by_key(state: &AppState) -> Result<HashMap<String, MatchItemDto>, ApiError> {
+    let key = "dotaItemsByKey";
+    if let Some(cached) = try_get_cache::<HashMap<String, MatchItemDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let (_, by_key) = load_item_constants(state).await?;
+    set_cache(state, &key, &by_key, LIST_TTL).await?;
+    Ok(by_key)
+}
+
+async fn load_item_constants(
+    state: &AppState,
+) -> Result<(HashMap<i64, MatchItemDto>, HashMap<String, MatchItemDto>), ApiError> {
     let url = format!("{}/constants/items", state.open_dota_api_url);
     let payload: HashMap<String, Value> = fetch_url(&state.client, &url).await?;
-    let mut items = HashMap::new();
+    let mut by_id = HashMap::new();
+    let mut by_key = HashMap::new();
 
-    for item in payload.values() {
+    for (item_key, item) in payload {
         let id = value_to_i64(item.get("id"));
         if id <= 0 {
             continue;
         }
         let name = value_to_string(item.get("dname"));
         let img = build_item_img_url(&value_to_string(item.get("img")));
-        items.insert(id, MatchItemDto { id, name, img });
+        let dto = MatchItemDto { id, name, img };
+        by_id.insert(id, dto.clone());
+        by_key.insert(item_key, dto);
     }
 
-    set_cache(state, key, &items, LIST_TTL).await?;
-    Ok(items)
+    Ok((by_id, by_key))
+}
+
+async fn fetch_item_timings(state: &AppState, hero_id: i64) -> Result<ItemTimingsDto, ApiError> {
+    let key = format!("itemTimings-{hero_id}");
+    if let Some(cached) = try_get_cache::<ItemTimingsDto>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let items = fetch_items_by_key(state).await?;
+    let url = format!(
+        "{}/scenarios/itemTimings?hero_id={hero_id}",
+        state.open_dota_api_url
+    );
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let mut timings: Vec<ItemTimingDto> = raw
+        .iter()
+        .filter_map(|v| map_item_timing(v, &items))
+        .filter(|t| t.games >= 10)
+        .collect();
+
+    timings.sort_by(|a, b| {
+        b.win_rate
+            .partial_cmp(&a.win_rate)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.games.cmp(&a.games))
+    });
+    timings.truncate(12);
+
+    let dto = ItemTimingsDto {
+        hero_id,
+        timings,
+    };
+    set_cache(state, &key, &dto, LIST_TTL).await?;
+    Ok(dto)
+}
+
+async fn fetch_lane_roles(state: &AppState, hero_id: i64) -> Result<LaneRolesDto, ApiError> {
+    let key = format!("laneRoles-{hero_id}");
+    if let Some(cached) = try_get_cache::<LaneRolesDto>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!(
+        "{}/scenarios/laneRoles?hero_id={hero_id}",
+        state.open_dota_api_url
+    );
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let mut roles: Vec<LaneRoleTimingDto> = raw
+        .iter()
+        .filter_map(map_lane_role_timing)
+        .filter(|r| r.games >= 10)
+        .collect();
+
+    roles.sort_by(|a, b| {
+        b.win_rate
+            .partial_cmp(&a.win_rate)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.games.cmp(&a.games))
+    });
+    roles.truncate(12);
+
+    let dto = LaneRolesDto { hero_id, roles };
+    set_cache(state, &key, &dto, LIST_TTL).await?;
+    Ok(dto)
+}
+
+fn map_item_timing(raw: &Value, items: &HashMap<String, MatchItemDto>) -> Option<ItemTimingDto> {
+    let item_key = value_to_string(raw.get("item"));
+    if item_key.is_empty() {
+        return None;
+    }
+
+    let games = value_to_i64(raw.get("games"));
+    let wins = value_to_i64(raw.get("wins"));
+    let time_secs = value_to_i64(raw.get("time"));
+    let win_rate = if games == 0 {
+        0.0
+    } else {
+        (wins as f64 / games as f64) * 100.0
+    };
+
+    let meta = items.get(&item_key);
+    Some(ItemTimingDto {
+        item: item_key.clone(),
+        item_name: meta
+            .map(|m| m.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| humanize_item_key(&item_key)),
+        item_img: meta.map(|m| m.img.clone()).unwrap_or_default(),
+        time_secs,
+        time_label: format_game_time(time_secs),
+        games,
+        wins,
+        win_rate,
+    })
+}
+
+fn map_lane_role_timing(raw: &Value) -> Option<LaneRoleTimingDto> {
+    let lane_role = value_to_i64(raw.get("lane_role"));
+    if lane_role <= 0 {
+        return None;
+    }
+
+    let games = value_to_i64(raw.get("games"));
+    let wins = value_to_i64(raw.get("wins"));
+    let time_secs = value_to_i64(raw.get("time"));
+    let win_rate = if games == 0 {
+        0.0
+    } else {
+        (wins as f64 / games as f64) * 100.0
+    };
+
+    Some(LaneRoleTimingDto {
+        lane_role,
+        lane_label: lane_role_label(lane_role).to_string(),
+        time_secs,
+        time_label: format_game_time(time_secs),
+        games,
+        wins,
+        win_rate,
+    })
+}
+
+fn lane_role_label(role: i64) -> &'static str {
+    match role {
+        1 => "Safe Lane",
+        2 => "Mid Lane",
+        3 => "Off Lane",
+        4 => "Jungle",
+        _ => "Unknown Lane",
+    }
+}
+
+fn humanize_item_key(key: &str) -> String {
+    key.split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_game_time(secs: i64) -> String {
+    let mins = secs / 60;
+    let rem = secs % 60;
+    format!("{mins}:{rem:02}")
 }
 
 async fn fetch_heroes(state: &AppState) -> Result<Vec<HeroDto>, ApiError> {
