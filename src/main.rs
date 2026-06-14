@@ -404,6 +404,17 @@ struct PlayerHeroStatDto {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct PlayerRatingDto {
+    #[serde(rename = "rankTier")]
+    rank_tier: i64,
+    #[serde(rename = "leaderboardRank")]
+    leaderboard_rank: Option<i64>,
+    #[serde(rename = "recordedAt")]
+    recorded_at: i64,
+    mmr: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct TeamPlayerDto {
     #[serde(rename = "accountId")]
     account_id: i64,
@@ -758,6 +769,7 @@ async fn main() {
         .route("/player/:id", get(get_player_by_id))
         .route("/player-recent-matches/:id", get(get_player_recent_matches))
         .route("/player-heroes/:id", get(get_player_heroes))
+        .route("/player-ratings/:id", get(get_player_ratings))
         .route("/pro-matches", get(get_pro_matches))
         .route("/match/:id", get(get_match_by_id))
         .route("/pro-teams", get(get_pro_teams))
@@ -926,6 +938,14 @@ async fn get_player_heroes(
 ) -> Result<Json<Vec<PlayerHeroStatDto>>, ApiError> {
     let heroes = fetch_player_heroes(&state, id).await?;
     Ok(Json(heroes))
+}
+
+async fn get_player_ratings(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<PlayerRatingDto>>, ApiError> {
+    let ratings = fetch_player_ratings(&state, id).await?;
+    Ok(Json(ratings))
 }
 
 async fn get_pro_matches(
@@ -1414,6 +1434,47 @@ async fn fetch_player_heroes(
     mapped.truncate(25);
     set_cache(state, &key, &mapped, LIST_TTL).await?;
     Ok(mapped)
+}
+
+async fn fetch_player_ratings(
+    state: &AppState,
+    account_id: i64,
+) -> Result<Vec<PlayerRatingDto>, ApiError> {
+    let key = format!("playerRatings-{account_id}");
+    if let Some(cached) = try_get_cache::<Vec<PlayerRatingDto>>(state, &key).await? {
+        return Ok(cached);
+    }
+
+    let url = format!("{}/players/{account_id}/ratings", state.open_dota_api_url);
+    let raw: Vec<Value> = fetch_url(&state.client, &url).await?;
+    let mut mapped: Vec<PlayerRatingDto> = raw.iter().filter_map(map_player_rating).collect();
+    mapped.sort_by_key(|r| r.recorded_at);
+    mapped.truncate(100);
+    set_cache(state, &key, &mapped, LIST_TTL).await?;
+    Ok(mapped)
+}
+
+fn map_player_rating(raw: &Value) -> Option<PlayerRatingDto> {
+    let rank_tier = value_to_i64(raw.get("rank_tier"));
+    let mmr = raw
+        .get("solo_competitive_rank")
+        .or_else(|| raw.get("competitive_rank"))
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0);
+    if rank_tier <= 0 && mmr.is_none() {
+        return None;
+    }
+
+    Some(PlayerRatingDto {
+        rank_tier,
+        leaderboard_rank: raw
+            .get("leaderboard_rank")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0),
+        recorded_at: value_to_i64(raw.get("time"))
+            .max(value_to_i64(raw.get("recorded_time"))),
+        mmr,
+    })
 }
 
 fn map_player_profile(
