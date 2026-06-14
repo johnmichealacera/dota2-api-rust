@@ -1292,9 +1292,74 @@ pub async fn fetch_pro_players(state: &AppState) -> Result<Vec<ProPlayerDto>, Ap
         .map(map_pro_player)
         .filter(|p| !p.name.is_empty())
         .collect();
+    enrich_pro_player_mmr(state, &mut mapped).await;
     mapped.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     set_cache(state, key, &mapped, LIST_TTL).await?;
     Ok(mapped)
+}
+
+const PRO_PLAYER_MMR_ENRICH_LIMIT: usize = 500;
+const PRO_PLAYER_MMR_BATCH_SIZE: usize = 10;
+
+async fn enrich_pro_player_mmr(state: &AppState, players: &mut [ProPlayerDto]) {
+    let mut indices: Vec<usize> = players
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.team_id > 0)
+        .map(|(i, _)| i)
+        .collect();
+    indices.sort_by(|&a, &b| players[b].last_match_time.cmp(&players[a].last_match_time));
+    indices.truncate(PRO_PLAYER_MMR_ENRICH_LIMIT);
+
+    info!(
+        "enriching MMR for {} of {} pro players",
+        indices.len(),
+        players.len()
+    );
+
+    for chunk in indices.chunks(PRO_PLAYER_MMR_BATCH_SIZE) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for &idx in chunk {
+            let account_id = players[idx].account_id;
+            let client = state.client.clone();
+            let api_url = state.open_dota_api_url.clone();
+            handles.push(tokio::spawn(async move {
+                fetch_player_rank_snapshot(&client, &api_url, account_id).await
+            }));
+        }
+        for (&idx, handle) in chunk.iter().zip(handles) {
+            if let Ok(Ok((rank_tier, mmr))) = handle.await {
+                players[idx].rank_tier = rank_tier;
+                players[idx].mmr = mmr;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
+async fn fetch_player_rank_snapshot(
+    client: &Client,
+    api_url: &str,
+    account_id: i64,
+) -> Result<(Option<i64>, Option<i64>), ApiError> {
+    let url = format!("{api_url}/players/{account_id}");
+    let raw: Value = fetch_url(client, &url).await?;
+    let rank_tier = raw
+        .get("rank_tier")
+        .and_then(|v| v.as_i64())
+        .filter(|t| *t > 0);
+    let mmr = raw
+        .get("mmr_estimate")
+        .and_then(|v| v.get("estimate"))
+        .and_then(|v| v.as_i64())
+        .filter(|m| *m > 0)
+        .or_else(|| {
+            raw.get("computed_mmr")
+                .and_then(|v| v.as_f64())
+                .map(|m| m.round() as i64)
+                .filter(|m| *m > 0)
+        });
+    Ok((rank_tier, mmr))
 }
 
 pub async fn fetch_pro_teams(state: &AppState) -> Result<Vec<TeamCardDto>, ApiError> {
@@ -1501,6 +1566,7 @@ pub fn map_pro_player(raw: ProPlayerRaw) -> ProPlayerDto {
         .filter(|s| !s.is_empty())
         .or(raw.personaname)
         .unwrap_or_default();
+    let team_id = raw.team_id.unwrap_or_default();
     ProPlayerDto {
         account_id: raw.account_id.unwrap_or_default(),
         name: display_name,
@@ -1509,6 +1575,11 @@ pub fn map_pro_player(raw: ProPlayerRaw) -> ProPlayerDto {
         country_code: raw.country_code.unwrap_or_default(),
         fantasy_role: raw.fantasy_role.unwrap_or(-1),
         avatar: raw.avatarfull.unwrap_or_default(),
+        team_id,
+        is_pro: raw.is_pro.unwrap_or(team_id > 0),
+        last_match_time: raw.last_match_time.unwrap_or_default(),
+        rank_tier: None,
+        mmr: None,
     }
 }
 

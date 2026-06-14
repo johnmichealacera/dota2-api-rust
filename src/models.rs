@@ -159,6 +159,9 @@ pub struct ProPlayerRaw {
     pub team_tag: Option<String>,
     pub country_code: Option<String>,
     pub fantasy_role: Option<i64>,
+    pub team_id: Option<i64>,
+    pub is_pro: Option<bool>,
+    pub last_match_time: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -175,6 +178,15 @@ pub struct ProPlayerDto {
     #[serde(rename = "fantasyRole")]
     pub fantasy_role: i64,
     pub avatar: String,
+    #[serde(rename = "teamId")]
+    pub team_id: i64,
+    #[serde(rename = "isPro")]
+    pub is_pro: bool,
+    #[serde(rename = "lastMatchTime")]
+    pub last_match_time: String,
+    #[serde(rename = "rankTier")]
+    pub rank_tier: Option<i64>,
+    pub mmr: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
