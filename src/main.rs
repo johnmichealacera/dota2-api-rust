@@ -121,6 +121,11 @@ struct SearchQuery {
     q: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct HeroStatsQuery {
+    bracket: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct PaginationMeta {
     #[serde(rename = "totalItems")]
@@ -729,7 +734,8 @@ async fn main() {
                 };
             }
             warm!("heroes",     fetch_heroes(&s));
-            warm!("hero-stats", fetch_hero_stats(&s));
+            warm!("hero-stats", fetch_hero_stats(&s, "pro"));
+            warm!("hero-stats-all", fetch_hero_stats(&s, "all"));
             warm!("teams",      fetch_pro_teams(&s));
             warm!("players",    fetch_pro_players(&s));
             info!("startup warm-up complete");
@@ -846,8 +852,10 @@ async fn get_hero_by_id(
 
 async fn get_hero_stats(
     State(state): State<AppState>,
+    Query(query): Query<HeroStatsQuery>,
 ) -> Result<Json<HashMap<String, HeroStatDto>>, ApiError> {
-    let stats = fetch_hero_stats(&state).await?;
+    let bracket = normalize_hero_stats_bracket(query.bracket.as_deref());
+    let stats = fetch_hero_stats(&state, bracket).await?;
     Ok(Json(stats))
 }
 
@@ -1184,9 +1192,12 @@ async fn fetch_heroes(state: &AppState) -> Result<Vec<HeroDto>, ApiError> {
     Ok(heroes)
 }
 
-async fn fetch_hero_stats(state: &AppState) -> Result<HashMap<String, HeroStatDto>, ApiError> {
-    let key = "heroStats";
-    if let Some(cached) = try_get_cache::<HashMap<String, HeroStatDto>>(state, key).await? {
+async fn fetch_hero_stats(
+    state: &AppState,
+    bracket: &str,
+) -> Result<HashMap<String, HeroStatDto>, ApiError> {
+    let key = format!("heroStats-{bracket}");
+    if let Some(cached) = try_get_cache::<HashMap<String, HeroStatDto>>(state, &key).await? {
         return Ok(cached);
     }
 
@@ -1197,20 +1208,67 @@ async fn fetch_hero_stats(state: &AppState) -> Result<HashMap<String, HeroStatDt
     for v in &raw {
         let Some(id) = v.get("id").and_then(|x| x.as_i64()) else { continue };
 
-        // Use pro-circuit stats exclusively so pick/win/ban are from the same population
-        let total_picks = v.get("pro_pick").and_then(|x| x.as_i64()).unwrap_or(0);
-        let total_wins  = v.get("pro_win" ).and_then(|x| x.as_i64()).unwrap_or(0);
-        let total_bans  = v.get("pro_ban" ).and_then(|x| x.as_i64()).unwrap_or(0);
+        let (total_picks, total_wins, total_bans) = hero_stats_for_bracket(v, bracket);
 
-        let win_rate = if total_picks == 0 { 50.0 } else {
+        let win_rate = if total_picks == 0 {
+            50.0
+        } else {
             (total_wins as f64 / total_picks as f64) * 100.0
         };
 
-        map.insert(id.to_string(), HeroStatDto { hero_id: id, win_rate, total_picks, total_bans });
+        map.insert(
+            id.to_string(),
+            HeroStatDto {
+                hero_id: id,
+                win_rate,
+                total_picks,
+                total_bans,
+            },
+        );
     }
 
-    set_cache(state, key, &map, LIST_TTL).await?;
+    set_cache(state, &key, &map, LIST_TTL).await?;
     Ok(map)
+}
+
+fn normalize_hero_stats_bracket(bracket: Option<&str>) -> &'static str {
+    let Some(b) = bracket else {
+        return "pro";
+    };
+    match b.to_ascii_lowercase().as_str() {
+        "all" => "all",
+        "legend" | "legend+" => "legend",
+        "divine" | "divine+" => "divine",
+        "immortal" => "immortal",
+        _ => "pro",
+    }
+}
+
+fn hero_stats_for_bracket(v: &Value, bracket: &str) -> (i64, i64, i64) {
+    if bracket == "pro" {
+        let total_picks = v.get("pro_pick").and_then(|x| x.as_i64()).unwrap_or(0);
+        let total_wins = v.get("pro_win").and_then(|x| x.as_i64()).unwrap_or(0);
+        let total_bans = v.get("pro_ban").and_then(|x| x.as_i64()).unwrap_or(0);
+        return (total_picks, total_wins, total_bans);
+    }
+
+    let indices: &[u8] = match bracket {
+        "legend" => &[5, 6, 7, 8],
+        "divine" => &[7, 8],
+        "immortal" => &[8],
+        _ => &[1, 2, 3, 4, 5, 6, 7, 8],
+    };
+
+    let mut total_picks = 0_i64;
+    let mut total_wins = 0_i64;
+    for idx in indices {
+        let pick_key = format!("{idx}_pick");
+        let win_key = format!("{idx}_win");
+        total_picks += v.get(&pick_key).and_then(|x| x.as_i64()).unwrap_or(0);
+        total_wins += v.get(&win_key).and_then(|x| x.as_i64()).unwrap_or(0);
+    }
+
+    (total_picks, total_wins, 0)
 }
 
 async fn fetch_hero_benchmarks(state: &AppState, hero_id: i64) -> Result<HeroBenchmarksDto, ApiError> {
